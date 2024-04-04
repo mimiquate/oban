@@ -21,6 +21,7 @@ jobs:
               otp: '23.3'
               postgres: '12.13-alpine'
             exclude_tags: 'lite'
+            blend: ecto_sql_3_10
           - pair:
               elixir: '1.16'
               otp: '26.0'
@@ -52,6 +53,10 @@ jobs:
         with:
           otp-version: ${{matrix.pair.otp}}
           elixir-version: ${{matrix.pair.elixir}}
+
+      - name: Use lock file variant
+        run: cp blend/${{ matrix.blend }}.mix.lock mix.lock
+        if: matrix.blend
 
       - uses: actions/cache@v4
         with:
