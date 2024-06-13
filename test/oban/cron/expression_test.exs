@@ -1,6 +1,8 @@
 defmodule Oban.Cron.ExpressionTest do
   use Oban.Case, async: true
 
+  use ExUnitProperties
+
   alias Oban.Cron.Expression, as: Expr
 
   describe "parse/1" do
@@ -131,7 +133,7 @@ defmodule Oban.Cron.ExpressionTest do
     list_of(one_of([constant(" "), constant("\t")]), min_length: 1)
   end
 
-  defp expression(min..max) do
+  defp expression(min..max//_) do
     gen all expr <-
               one_of([
                 constant("*"),

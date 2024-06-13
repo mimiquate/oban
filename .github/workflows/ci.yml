@@ -23,9 +23,9 @@ jobs:
             exclude_tags: 'lite'
             blend: ecto_sql_3_10
           - pair:
-              elixir: '1.16'
-              otp: '26.0'
-              postgres: '15.1-alpine'
+              elixir: '1.17'
+              otp: '27.0'
+              postgres: '16.2-alpine'
             exclude_tags: 'gossip'
             lint: lint
 

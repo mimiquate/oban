@@ -2,7 +2,7 @@ defmodule Oban.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/sorentwo/oban"
-  @version "2.17.10"
+  @version "2.18.0-dev"
 
   def project do
     [
@@ -164,10 +164,10 @@ defmodule Oban.MixProject do
       {:telemetry, "~> 0.4 or ~> 1.0"},
 
       # Test & dev
-      {:stream_data, "~> 0.4", only: [:test, :dev]},
+      {:stream_data, "~> 1.0", only: [:test, :dev]},
       {:tz, "~> 0.24", only: [:test, :dev]},
       {:benchee, "~> 1.0", only: [:test, :dev], runtime: false},
-      {:credo, "~> 1.6", only: [:test, :dev], runtime: false},
+      {:credo, "~> 1.7.7-rc.0", only: [:test, :dev], runtime: false},
       {:dialyxir, "~> 1.0", only: [:test, :dev], runtime: false},
       {:ex_doc, "~> 0.28", only: [:test, :dev], runtime: false},
       {:makeup_diff, "~> 0.1", only: [:test, :dev], runtime: false},

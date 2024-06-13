@@ -3,8 +3,6 @@ defmodule Oban.Stager do
 
   use GenServer
 
-  import Ecto.Query, only: [distinct: 2, select: 3, where: 3]
-
   alias Oban.{Engine, Job, Notifier, Peer, Plugin, Repo}
   alias __MODULE__, as: State
 
@@ -40,17 +38,7 @@ defmodule Oban.Stager do
     # Init event is essential for auto-allow and backward compatibility.
     :telemetry.execute([:oban, :plugin, :init], %{}, %{conf: state.conf, plugin: __MODULE__})
 
-    {:ok, state, {:continue, :start}}
-  end
-
-  @impl GenServer
-  def handle_continue(:start, %State{} = state) do
-    state =
-      state
-      |> schedule_staging()
-      |> check_mode()
-
-    {:noreply, state}
+    {:ok, schedule_staging(state)}
   end
 
   @impl GenServer
@@ -62,6 +50,7 @@ defmodule Oban.Stager do
 
   @impl GenServer
   def handle_info(:stage, %State{} = state) do
+    state = check_mode(state)
     meta = %{conf: state.conf, leader: Peer.leader?(state.conf), plugin: __MODULE__}
 
     :telemetry.span([:oban, :plugin], meta, fn ->
@@ -74,12 +63,7 @@ defmodule Oban.Stager do
       end
     end)
 
-    state =
-      state
-      |> schedule_staging()
-      |> check_mode()
-
-    {:noreply, state}
+    {:noreply, schedule_staging(state)}
   end
 
   defp stage_and_notify(true = _leader, state) do
@@ -101,14 +85,9 @@ defmodule Oban.Stager do
   end
 
   defp notify_queues(%{conf: conf, mode: :global}) do
-    query =
-      Job
-      |> where([j], j.state == "available")
-      |> where([j], not is_nil(j.queue))
-      |> select([j], %{queue: j.queue})
-      |> distinct(true)
+    {:ok, queues} = Engine.check_available(conf)
 
-    payload = Repo.all(conf, query)
+    payload = Enum.map(queues, &%{queue: &1})
 
     Notifier.notify(conf, :insert, payload)
   end

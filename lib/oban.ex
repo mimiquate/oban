@@ -55,7 +55,7 @@ defmodule Oban do
           | {:prefix, false | String.t()}
           | {:queues, false | [{queue_name(), pos_integer() | Keyword.t()}]}
           | {:repo, module()}
-          | {:shutdown_grace_period, timeout()}
+          | {:shutdown_grace_period, non_neg_integer()}
           | {:stage_interval, timeout()}
           | {:testing, :disabled | :inline | :manual}
 
@@ -400,11 +400,20 @@ defmodule Oban do
 
   ## Node Name
 
-  When the `node` value hasn't been configured it is generated based on the environment:
+  When the `node` value has not been configured it is generated based on the environment:
 
-  * In a distributed system the node name is used
-  * In a Heroku environment the system environment's `DYNO` value is used
-  * Otherwise, the system hostname is used
+  1. If the local node is alive (e.g. in a distributed system, or when running from a mix release)
+     the node name is used
+  2. In a Heroku environment the system environment's `DYNO` value is used
+  3. Otherwise, the system hostname is used
+
+  When running a mix release on a Heroku node, the node is alive even if not part of a
+  distributed system. In order to use the `DYNO` value, configure the node value using runtime
+  configuration via `config/runtime.exs`:
+
+        config :my_app, Oban,
+          node: System.get_env("DYNO", "nonode@nohost")
+
   """
   @doc since: "0.1.0"
   @spec start_link([option()]) :: Supervisor.on_start()

@@ -63,7 +63,7 @@ defmodule Oban.Job do
           | :worker
         ]
 
-  @type replace_by_state_option :: [
+  @type replace_by_state_option ::
           {:available, [replace_option()]}
           | {:cancelled, [replace_option()]}
           | {:completed, [replace_option()]}
@@ -71,7 +71,6 @@ defmodule Oban.Job do
           | {:executing, [replace_option()]}
           | {:retryable, [replace_option()]}
           | {:scheduled, [replace_option()]}
-        ]
 
   @type schedule_in_option :: pos_integer() | {pos_integer(), time_unit()}
 
@@ -79,11 +78,11 @@ defmodule Oban.Job do
           {:args, args()}
           | {:max_attempts, pos_integer()}
           | {:meta, map()}
-          | {:priority, pos_integer()}
+          | {:priority, 0..9}
           | {:queue, atom() | binary()}
-          | {:schedule_in, schedule_in_option()}
-          | {:replace_args, boolean()}
           | {:replace, [replace_option() | replace_by_state_option()]}
+          | {:replace_args, boolean()}
+          | {:schedule_in, schedule_in_option()}
           | {:scheduled_at, DateTime.t()}
           | {:tags, tags()}
           | {:unique, [unique_option()]}
@@ -101,7 +100,7 @@ defmodule Oban.Job do
           attempted_by: [binary()] | nil,
           max_attempts: pos_integer(),
           meta: map(),
-          priority: non_neg_integer(),
+          priority: 0..9,
           inserted_at: DateTime.t(),
           scheduled_at: DateTime.t(),
           attempted_at: DateTime.t() | nil,

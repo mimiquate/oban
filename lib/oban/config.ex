@@ -24,7 +24,7 @@ defmodule Oban.Config do
           prefix: false | String.t(),
           queues: Keyword.t(Keyword.t()),
           repo: module(),
-          shutdown_grace_period: timeout(),
+          shutdown_grace_period: non_neg_integer(),
           stage_interval: timeout(),
           testing: :disabled | :inline | :manual
         }
@@ -164,9 +164,10 @@ defmodule Oban.Config do
   end
 
   defp inline_testing?(pid, default) do
-    {:dictionary, dictionary} = Process.info(pid, :dictionary)
-
-    Keyword.get(dictionary, :oban_testing, default) == :inline
+    case Process.info(pid, :dictionary) do
+      {:dictionary, dictionary} -> Keyword.get(dictionary, :oban_testing, default) == :inline
+      _ -> false
+    end
   end
 
   @doc false

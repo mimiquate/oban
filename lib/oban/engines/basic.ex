@@ -169,6 +169,18 @@ defmodule Oban.Engines.Basic do
   end
 
   @impl Engine
+  def check_available(%Config{} = conf) do
+    query =
+      Job
+      |> where([j], j.state == "available")
+      |> where([j], not is_nil(j.queue))
+      |> select([j], j.queue)
+      |> distinct(true)
+
+    {:ok, Repo.all(conf, query)}
+  end
+
+  @impl Engine
   def complete_job(%Config{} = conf, %Job{} = job) do
     Repo.update_all(
       conf,
@@ -330,7 +342,9 @@ defmodule Oban.Engines.Basic do
       {:ok, %Job{job | conflict?: true}}
     else
       {:error, :locked} ->
-        Changeset.apply_action(changeset, :insert)
+        with {:ok, job} <- Changeset.apply_action(changeset, :insert) do
+          %Job{job | conflict?: true}
+        end
 
       nil ->
         Repo.insert(conf, changeset, opts)

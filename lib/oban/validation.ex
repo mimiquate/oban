@@ -149,7 +149,7 @@ defmodule Oban.Validation do
     end
   end
 
-  defp validate_type({:range, min..max}, key, val) when val < min or val > max do
+  defp validate_type({:range, min..max//_}, key, val) when val < min or val > max do
     {:error, "expected #{inspect(key)} to be between #{min}..#{max}, got: #{inspect(val)}"}
   end
 
@@ -181,7 +181,7 @@ defmodule Oban.Validation do
   end
 
   defp validate_type(:timeout, key, val)
-       when (not is_integer(val) or val <= 0) and val != :infinity do
+       when (not is_integer(val) or val < 0) and val != :infinity do
     {:error,
      "expected #{inspect(key)} to be a positive integer or :infinity, got: #{inspect(val)}"}
   end

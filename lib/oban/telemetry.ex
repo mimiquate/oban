@@ -35,7 +35,7 @@ defmodule Oban.Telemetry do
   | `:stop`      | `:duration`, `:queue_time` | `:conf`, `:job`, `:state`, `:result`                                    |
   | `:exception` | `:duration`, `:queue_time` | `:conf`, `:job`, `:state`, `:kind`, `:reason`, `:result`, `:stacktrace` |
 
-  ### Metadata
+  #### Metadata
 
   * `:conf` — the executing Oban instance's config
   * `:job` — the executing `Oban.Job`
@@ -58,6 +58,7 @@ defmodule Oban.Telemetry do
   * `[:oban, :engine, :init, :start | :stop | :exception]`
   * `[:oban, :engine, :refresh, :start | :stop | :exception]`
   * `[:oban, :engine, :put_meta, :start | :stop | :exception]`
+  * `[:oban, :engine, :check_available, :start | :stop | :exception]`
 
   | event        | measures       | metadata                                              |
   | ------------ | -------------- | ----------------------------------------------------- |
@@ -97,7 +98,7 @@ defmodule Oban.Telemetry do
   | `:stop`      | `:duration`    | `:conf`, `:engine`, `:job`                                    |
   | `:exception` | `:duration`    | `:conf`, `:engine`, `:job`, `:kind`, `:reason`, `:stacktrace` |
 
-  ### Metadata
+  #### Metadata
 
   * `:conf` — the Oban supervisor's config
   * `:engine` — the module of the engine used
@@ -117,7 +118,7 @@ defmodule Oban.Telemetry do
   | `:stop`      | `:duration`    | `:conf`, `:channel`, `:payload`                                     |
   | `:exception` | `:duration`    | `:conf`, `:channel`, `:payload`, `:kind`, `:reason`, `:stacktrace`  |
 
-  ### Metadata
+  #### Metadata
 
   * `:conf` — the Oban supervisor's config
   * `:channel` — the channel on which the notification was sent
@@ -134,7 +135,7 @@ defmodule Oban.Telemetry do
   | ------------ | --------- | ------------------ |
   | `:switch`    |           | `:conf`, `:status` |
 
-  ### Metadata
+  #### Metadata
 
   * `:conf` — see the explanation in metadata above
   * `:status` — one of `:isolated`, `:solitary`, or `:clustered`, see
@@ -179,11 +180,28 @@ defmodule Oban.Telemetry do
   | `:stop`      | `:duration`    | `:conf`, `:leader`, `:peer`,                                   |
   | `:exception` | `:duration`    | `:conf`, `:leader`, `:peer`, `:kind`, `:reason`, `:stacktrace` |
 
-  ### Metadata
+  #### Metadata
 
   * `:conf`, `:kind`, `:reason`, `:stacktrace` — see the explanation in notifier metadata above
   * `:leader` — whether the peer is the current leader
   * `:peer` — the module used for peering
+
+  ## Queue Shutdown Events
+
+  Oban emits an event when a queue shuts down cleanly, e.g. without being brutally killed. Event
+  emission isn't guaranteed because it is emitted part of a `terminate/1` callback.
+
+  * `[:oban, :queue, :shutdown]`
+
+  | event       | measures    | metadata                       |
+  | ----------- | ----------- | ------------------------------ |
+  | `:shutdown` | `:ellapsed` | `:conf`, `:orphaned`, `:queue` |
+
+  #### Metadata
+
+  * `:conf` — see the explanation in metadata above
+  * `:orphaned` — a list of job id's left in an `executing` state because they couldn't finish
+  * `:queue` — the stringified queue name
 
   ## Stager Events
 
@@ -195,7 +213,7 @@ defmodule Oban.Telemetry do
   | ------------ | --------- | ---------------- |
   | `:switch`    |           | `:conf`, `:mode` |
 
-  ### Metadata
+  #### Metadata
 
   * `:conf` — see the explanation in metadata above
   * `:mode` — either `local` for polling mode or `global` in the more efficient pub-sub mode
@@ -272,7 +290,10 @@ defmodule Oban.Telemetry do
   @doc """
   Attaches a default structured JSON Telemetry handler for logging.
 
-  This function attaches a handler that outputs logs with the following fields for job events:
+  This function attaches a handler that outputs logs with `message` and `source` fields, along
+  with some event specific fields.
+
+  #### Job Events
 
   * `args` — a map of the job's raw arguments
   * `attempt` — the job's execution atttempt
@@ -282,26 +303,30 @@ defmodule Oban.Telemetry do
   * `id` — the job's id
   * `meta` — a map of the job's raw metadata
   * `queue` — the job's queue
-  * `source` — always "oban"
   * `state` — the execution state, one of "success", "failure", "cancelled", "discard", or
     "snoozed"
   * `system_time` — when the job started, in microseconds
   * `tags` — the job's tags
   * `worker` — the job's worker module
 
-  For stager events:
+  #### Queue Shutdown Events
+
+  * `ellapsed` — the amount of time the queue waited for shutdown, in milliseconds
+  * `event` — always `queue:shutdown`
+  * `orphaned` — a list of any job id's left in an `executing` state
+  * `queue` — the queue name
+
+  #### Notifier Events
+
+  * `event` — always `notifier:switch`
+  * `message` — information about the status switch
+  * `status` — either `"isolated"`, `"solitary"`, or `"clustered"`
+
+  #### Stager Events
 
   * `event` — always `stager:switch`
   * `message` — information about the mode switch
   * `mode` — either `"local"` or `"global"`
-  * `source` — always "oban"
-
-  For notifier events:
-
-  * `event` — always `notifier:switch`
-  * `message` — information about the status switch
-  * `source` — always "oban"
-  * `status` — either `"isolated"`, `"solitary"`, or `"clustered"`
 
   ## Options
 
@@ -336,6 +361,7 @@ defmodule Oban.Telemetry do
       [:oban, :job, :stop],
       [:oban, :job, :exception],
       [:oban, :notifier, :switch],
+      [:oban, :queue, :shutdown],
       [:oban, :stager, :switch]
     ]
 
@@ -406,14 +432,14 @@ defmodule Oban.Telemetry do
         :isolated ->
           %{
             event: "notifier:switch",
-            status: status,
+            connectivity_status: status,
             message: "notifier can't receive messages from any nodes, functionality degraded"
           }
 
         :solitary ->
           %{
             event: "notifier:switch",
-            status: status,
+            connectivity_status: status,
             message:
               "notifier only receiving messages from its own node, functionality may be degraded"
           }
@@ -421,10 +447,22 @@ defmodule Oban.Telemetry do
         :clustered ->
           %{
             event: "notifier:switch",
-            status: status,
+            connectivity_status: status,
             message: "notifier is receiving messages from other nodes"
           }
       end
+    end)
+  end
+
+  def handle_event([:oban, :queue, :shutdown], measure, %{orphaned: [_ | _]} = meta, opts) do
+    log(opts, fn ->
+      %{
+        ellapsed: measure.ellapsed,
+        event: "queue:shutdown",
+        orphaned: meta.orphaned,
+        queue: meta.queue,
+        message: "jobs were orphaned because they didn't finish executing in the allotted time"
+      }
     end)
   end
 
@@ -449,6 +487,8 @@ defmodule Oban.Telemetry do
       end
     end)
   end
+
+  def handle_event(_event, _measure, _meta, _opts), do: :ok
 
   defp log(opts, fun) do
     level = Keyword.fetch!(opts, :level)
