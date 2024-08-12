@@ -24,3 +24,7 @@ oban-*.tar
 
 # Ignore local .db files
 /priv/*.db*
+
+# Blend
+/blend/_build
+/blend/deps
