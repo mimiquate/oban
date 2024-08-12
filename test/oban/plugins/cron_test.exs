@@ -37,7 +37,6 @@ defmodule Oban.Plugins.CronTest do
 
     test ":crontab worker options are validated" do
       refute_valid("expected valid job options", crontab: [{"* * * * *", Worker, priority: -1}])
-      refute_valid("expected valid job options", crontab: [{"* * * * *", Worker, unique: []}])
     end
 
     test ":timezone is validated as a known timezone" do
@@ -99,30 +98,6 @@ defmodule Oban.Plugins.CronTest do
     assert [1, 3] == inserted_refs()
   end
 
-  test "cron jobs are not enqueued twice within the same minute" do
-    run_with_opts(crontab: [{"* * * * *", Worker, args: worker_args(1)}])
-
-    assert [1] == inserted_refs()
-
-    run_with_opts(crontab: [{"* * * * *", Worker, args: worker_args(1)}])
-
-    assert [1] == inserted_refs()
-  end
-
-  test "cron jobs are only enqueued once between nodes" do
-    opts = [crontab: [{"* * * * *", Worker, args: worker_args(1)}]]
-
-    name1 = start_supervised_oban!(plugins: [{Cron, opts}])
-    name2 = start_supervised_oban!(plugins: [{Cron, opts}])
-    name3 = start_supervised_oban!(plugins: [{Cron, opts}])
-
-    [name1, name2, name3]
-    |> Task.async_stream(&send_evaluate/1)
-    |> Stream.run()
-
-    assert [1] == inserted_refs()
-  end
-
   test "cron jobs are scheduled using the configured timezone" do
     {:ok, %DateTime{hour: chi_hour}} = DateTime.now("America/Chicago")
     {:ok, %DateTime{hour: utc_hour}} = DateTime.now("Etc/UTC")
@@ -172,7 +147,7 @@ defmodule Oban.Plugins.CronTest do
 
     name
     |> Registry.whereis(Oban.Peer)
-    |> Agent.update(fn _ -> true end)
+    |> Agent.update(&%{&1 | leader?: true})
 
     send_evaluate(name)
 

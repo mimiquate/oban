@@ -104,7 +104,7 @@ defmodule Oban.Engines.Basic do
     # of the CTE, e.g. "public"."subset".
     query =
       Job
-      |> with_cte("subset", as: ^subset_query, materialized: true)
+      |> with_cte("subset", as: ^subset_query)
       |> join(:inner, [j], x in fragment(~s("subset")), on: true)
       |> where([j, x], j.id == x.id)
       |> where([j, _], j.attempt < j.max_attempts)
@@ -343,7 +343,7 @@ defmodule Oban.Engines.Basic do
     else
       {:error, :locked} ->
         with {:ok, job} <- Changeset.apply_action(changeset, :insert) do
-          %Job{job | conflict?: true}
+          {:ok, %Job{job | conflict?: true}}
         end
 
       nil ->

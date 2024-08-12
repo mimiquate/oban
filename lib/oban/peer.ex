@@ -60,10 +60,9 @@ defmodule Oban.Peer do
 
   require Logger
 
-  @type option ::
-          {:name, module()}
-          | {:conf, Config.t()}
-          | {:interval, timeout()}
+  @type option :: [name: module(), conf: Config.t(), interval: timeout()]
+
+  @type conf_or_name :: Config.t() | GenServer.name()
 
   @doc """
   Starts a peer instance.
@@ -73,7 +72,12 @@ defmodule Oban.Peer do
   @doc """
   Check whether the current peer instance leads the cluster.
   """
-  @callback leader?(Config.t() | GenServer.server()) :: boolean()
+  @callback leader?(GenServer.server()) :: boolean()
+
+  @doc """
+  Check which node's peer instance currently leads the cluster.
+  """
+  @callback get_leader(GenServer.server()) :: nil | String.t()
 
   @doc false
   @spec child_spec(Keyword.t()) :: Supervisor.child_spec()
@@ -86,6 +90,26 @@ defmodule Oban.Peer do
       |> Keyword.put_new(:name, peer)
 
     %{id: opts[:name], start: {peer, :start_link, [opts]}}
+  end
+
+  @doc """
+  Get the name and node of the instance that currently leads the cluster.
+
+  ## Example
+
+  Get the leader node for the default Oban instance:
+
+      Oban.Peer.get_leader()
+      "web.1"
+
+  Get the leader node for an alternate instance named `Oban.Private`
+
+      Oban.Peer.get_leader(Oban.Private)
+      "web.1"
+  """
+  @spec get_leader(conf_or_name, timeout()) :: nil | String.t()
+  def get_leader(conf_or_name \\ Oban, timeout \\ 5_000) do
+    safe_call(conf_or_name, :get_leader, timeout, nil)
   end
 
   @doc """
@@ -103,27 +127,33 @@ defmodule Oban.Peer do
       Oban.Peer.leader?(Oban.Private)
       # => true
   """
-  @spec leader?(Config.t() | GenServer.server()) :: boolean()
-  def leader?(conf_or_name \\ Oban, timeout \\ 5_000)
+  @spec leader?(conf_or_name(), timeout()) :: boolean()
+  def leader?(conf_or_name \\ Oban, timeout \\ 5_000) do
+    safe_call(conf_or_name, :leader?, timeout, false)
+  end
 
-  def leader?(%Config{name: name, peer: {peer, _}}, timeout) do
+  defp safe_call(%Config{name: name, peer: {peer, _}}, fun, timeout, default) do
     case Registry.whereis(name, Oban.Peer) do
       pid when is_pid(pid) ->
-        peer.leader?(pid, timeout)
+        apply(peer, fun, [pid, timeout])
 
-      nil ->
-        false
+      _ ->
+        default
     end
   catch
     :exit, {:timeout, _} = reason ->
-      Logger.warning("Oban.Peer.leader?/2 check failed due to #{inspect(reason)}.")
+      Logger.warning(
+        message: "Oban.Peer.#{fun}/2 check failed due to #{inspect(reason)}",
+        source: :oban,
+        module: __MODULE__
+      )
 
-      false
+      default
   end
 
-  def leader?(name, timeout) do
+  defp safe_call(name, fun, timeout, default) do
     name
     |> Oban.config()
-    |> leader?(timeout)
+    |> safe_call(fun, timeout, default)
   end
 end
