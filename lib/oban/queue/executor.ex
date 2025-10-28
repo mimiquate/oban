@@ -96,6 +96,11 @@ defmodule Oban.Queue.Executor do
   def record_started(%__MODULE__{} = exec) do
     :telemetry.execute([:oban, :job, :start], %{system_time: exec.start_time}, exec.meta)
 
+    Logger.info(
+      "Oban Job Start #{exec.meta.worker} id:#{exec.meta.id} attempt:#{exec.meta.attempt}/#{exec.meta.max_attempts}",
+      domain: [:oban]
+    )
+
     exec
   end
 
@@ -284,6 +289,12 @@ defmodule Oban.Queue.Executor do
 
     :telemetry.execute([:oban, :job, :exception], measurements(exec), meta)
 
+    Logger.error(
+      "Oban Job Exception #{exec.meta.worker} id:#{exec.meta.id} attempt:#{exec.meta.attempt}/#{exec.meta.max_attempts}\n\n#{Exception.format(kind, exec.error, exec.stacktrace)}",
+      domain: [:oban],
+      crash_reason: crash_reason(kind, exec.error, exec.stacktrace)
+    )
+
     exec
   end
 
@@ -298,8 +309,16 @@ defmodule Oban.Queue.Executor do
 
     :telemetry.execute([:oban, :job, :stop], measurements(exec), meta)
 
+    Logger.info(
+      "Oban Job Stop #{exec.meta.worker} id:#{exec.meta.id} attempt:#{exec.meta.attempt}/#{exec.meta.max_attempts} duration:#{exec.duration}",
+      domain: [:oban]
+    )
+
     exec
   end
+
+  defp crash_reason(:throw, reason, stacktrace), do: {{:nocatch, reason}, stacktrace}
+  defp crash_reason(_, reason, stacktrace), do: {reason, stacktrace}
 
   @spec record_unsaved(t()) :: t()
   def record_unsaved(%__MODULE__{error: error} = exec) when not is_nil(error) do
