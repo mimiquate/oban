@@ -28,7 +28,7 @@ defmodule MyApp.Workers.ScheduledWorker do
   @impl true
   def perform(%{args: %{"email" => email} = args, attempt: 1}) do
     args
-    |> new(schedule_in: @one_day)
+    |> new(scheduled_in: @one_day)
     |> Oban.insert!()
 
     Mailer.deliver_email(email)
@@ -63,13 +63,13 @@ along with the underlying feature that made it possible._
 
 ## Considerations for Scheduling Jobs in the Very-Near-Future
 
-If you use the `schedule_in` or `scheduled_at` options with a value that will
+If you use the `scheduled_in` or `scheduled_at` options with a value that will
 resolve to the very-near-future, for example:
 
 ```elixir
 # 1 second from now
 %{}
-|> new(schedule_in: 1)
+|> new(scheduled_in: 1)
 |> Oban.insert()
 
 # 500 milliseconds from now
@@ -81,9 +81,9 @@ very_soon = DateTime.utc_now() |> DateTime.add(500, :millisecond)
 ```
 
 your workers may not be aware of/attempt to perform the job until the next tick as specified by the
-`:stage_interval` configuration option. By default this is set to `1_000ms`.
+stager's `:interval` option, e.g. `stager: [interval: 1_000]`. By default this is set to `1_000ms`.
 
-**Be aware:** Configuring the `:stage_interval` option below the recommended default
+**Be aware:** Configuring the stager's `:interval` below the recommended default
 can have a considerable impact on database performance! It is not advised to
 lower this value and should only be done as a last resort after considering
 other ways to achieve your desired outcome.

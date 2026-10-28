@@ -11,29 +11,22 @@ defmodule Oban.Job do
   use Ecto.Schema
 
   import Ecto.Changeset
+  import Ecto.Query, only: [where: 3]
+  import Oban.Period, only: [is_valid_period: 1]
 
   alias Ecto.Changeset
+  alias Oban.Period
   alias Oban.Validation
 
   @type args :: map()
   @type errors :: [%{at: DateTime.t(), attempt: pos_integer(), error: binary()}]
   @type tags :: [binary()]
 
-  @type time_unit ::
-          :second
-          | :seconds
-          | :minute
-          | :minutes
-          | :hour
-          | :hours
-          | :day
-          | :days
-          | :week
-          | :weeks
+  @type time_unit :: Period.time_unit()
 
   @type unique_field :: :args | :meta | :queue | :worker
 
-  @type unique_period :: pos_integer() | {pos_integer(), time_unit()} | :infinity
+  @type unique_period :: Period.t() | :infinity
 
   @type unique_state_group :: :all | :incomplete | :scheduled | :successful
 
@@ -45,6 +38,7 @@ defmodule Oban.Job do
           | :executing
           | :retryable
           | :scheduled
+          | :suspended
 
   @type unique_timestamp :: :inserted_at | :scheduled_at
 
@@ -52,7 +46,7 @@ defmodule Oban.Job do
           {:fields, [unique_field()]}
           | {:keys, [atom()]}
           | {:period, unique_period()}
-          | {:states, [unique_state()]}
+          | {:states, unique_state_group() | [unique_state()]}
           | {:timestamp, unique_timestamp()}
 
   @type replace_option :: [
@@ -74,6 +68,7 @@ defmodule Oban.Job do
           | {:executing, [replace_option()]}
           | {:retryable, [replace_option()]}
           | {:scheduled, [replace_option()]}
+          | {:suspended, [replace_option()]}
 
   @type schedule_in_option :: pos_integer() | {pos_integer(), time_unit()}
 
@@ -87,6 +82,7 @@ defmodule Oban.Job do
           | {:replace_args, boolean()}
           | {:schedule_in, schedule_in_option()}
           | {:scheduled_at, DateTime.t()}
+          | {:scheduled_in, schedule_in_option()}
           | {:tags, tags()}
           | {:unique, true | false | nil | [unique_option()]}
           | {:worker, atom() | binary()}
@@ -163,6 +159,8 @@ defmodule Oban.Job do
     field :unsaved_error, :map, virtual: true
   end
 
+  # Param Attributes
+
   @permitted_params ~w(
     args
     attempt
@@ -196,36 +194,44 @@ defmodule Oban.Job do
 
   @required_params ~w(worker args)a
   @replace_options ~w(args max_attempts meta priority queue scheduled_at tags worker)a
-  @virtual_params ~w(replace replace_args schedule_in unique)a
+  @virtual_params ~w(replace replace_args schedule_in scheduled_in unique)a
 
-  @time_units ~w(
-    second
-    seconds
-    minute
-    minutes
-    hour
-    hours
-    day
-    days
-    week
-    weeks
+  # Query Attributes
+
+  @query_fields ~w(
+    id
+    state
+    queue
+    worker
+    priority
+    attempt
+    max_attempts
+    tags
+    args
+    meta
+    attempted_at
+    cancelled_at
+    completed_at
+    discarded_at
+    inserted_at
+    scheduled_at
   )a
+
+  # Unique Attributes
+
+  @insertion_states ~w(scheduled available suspended)a
+  @keyable_fields ~w(args meta)a
 
   @unique_fields ~w(args meta queue worker)a
   @unique_timestamps ~w(inserted_at scheduled_at)a
-  @keyable_fields ~w(args meta)a
 
   @unique_defaults %{
     fields: ~w(args queue worker)a,
     keys: [],
     period: 60,
-    states: ~w(scheduled available executing retryable completed)a,
+    states: :successful,
     timestamp: :inserted_at
   }
-
-  defguardp is_timestampable(value)
-            when is_integer(value) or
-                   (is_integer(elem(value, 0)) and elem(value, 1) in @time_units)
 
   @doc """
   Construct a new job changeset ready for insertion into the database.
@@ -247,7 +253,7 @@ defmodule Oban.Job do
 
     * `:scheduled_at` - a time in the future after which the job should be executed
 
-    * `:schedule_in` - the number of seconds until the job should be executed or a tuple containing
+    * `:scheduled_in` - the number of seconds until the job should be executed or a tuple containing
       a number and unit
 
     * `:tags` — a list of tags to group and organize related jobs, i.e. to identify scheduled jobs
@@ -272,11 +278,11 @@ defmodule Oban.Job do
 
   Schedule a job to run in 5 seconds:
 
-      MyApp.Worker.new(%{id: 1}, schedule_in: 5)
+      MyApp.Worker.new(%{id: 1}, scheduled_in: 5)
 
   Schedule a job to run in 5 minutes:
 
-      MyApp.Worker.new(%{id: 1}, schedule_in: {5, :minutes})
+      MyApp.Worker.new(%{id: 1}, scheduled_in: {5, :minutes})
 
   Insert a job, ensuring that it is unique within the past minute:
 
@@ -323,7 +329,7 @@ defmodule Oban.Job do
     |> validate_keys(params, @permitted_params ++ @virtual_params)
     |> validate_required(@required_params)
     |> put_replace(params[:replace], params[:replace_args])
-    |> put_scheduling(params[:schedule_in])
+    |> put_scheduling(params)
     |> put_unique(params[:unique])
     |> validate_length(:queue, min: 1, max: 128)
     |> validate_length(:worker, min: 1, max: 128)
@@ -371,9 +377,11 @@ defmodule Oban.Job do
   ## Examples
 
       iex> Oban.Job.states() -- [:completed, :discarded]
-      ~w(scheduled available executing retryable cancelled)a
+      ~w(suspended scheduled available executing retryable cancelled)a
 
   ## Job State Transitions
+
+  * `:suspended`—Jobs that are held and won't be processed until they are resumed
 
   * `:scheduled`—Jobs inserted with `scheduled_at` in the future are `:scheduled`. After the
     `scheduled_at` time has elapsed Oban's job staging will transition them to `:available`
@@ -397,7 +405,7 @@ defmodule Oban.Job do
   """
   @doc since: "2.1.0"
   def states do
-    ~w(scheduled available executing retryable completed discarded cancelled)a
+    ~w(suspended scheduled available executing retryable completed discarded cancelled)a
   end
 
   @doc """
@@ -413,7 +421,7 @@ defmodule Oban.Job do
   ## Examples
 
       iex> Oban.Job.unique_states(:incomplete)
-      ~w(available scheduled executing retryable)a
+      ~w(suspended available scheduled executing retryable)a
 
       iex> Oban.Job.unique_states(:scheduled)
       ~w(scheduled)a
@@ -421,9 +429,123 @@ defmodule Oban.Job do
   """
   @doc since: "2.20.0"
   def unique_states(:all), do: states()
-  def unique_states(:incomplete), do: ~w(available scheduled executing retryable)a
+  def unique_states(:incomplete), do: ~w(suspended available scheduled executing retryable)a
   def unique_states(:scheduled), do: ~w(scheduled)a
-  def unique_states(:successful), do: ~w(available scheduled executing retryable completed)a
+
+  def unique_states(:successful),
+    do: ~w(suspended available scheduled executing retryable completed)a
+
+  @doc """
+  Build a composable query over `Oban.Job` from a keyword list of filters.
+
+  * Scalar values become equality matches
+  * List values become `IN` matches, except the `:tags` field, which is always compared as a
+    complete array
+  * Atom values are coerced to strings for `:state` and `:queue`, and modules are coerced for
+    `:worker`.
+  * Map values for `:args` and `:meta` become JSONB containment matches, with nested maps and
+    multiple keys supported natively. Only Postgres is supported; SQLite and MySQL users should
+    compose JSON filters with `Ecto.Query` directly.
+  * Unknown fields, `nil` values, empty lists (except on `:tags`), and empty maps will raise an
+    `ArgumentError`.
+
+  The return value is an `Ecto.Queryable` that can be piped into further `Ecto.Query` composition
+  or passed to functions like `Oban.cancel_all_jobs/2` and `Oban.delete_all_jobs/2`.
+
+  ## Examples
+
+  Match a single field:
+
+      Oban.Job.query(state: "completed")
+
+  Match multiple values in a field:
+
+      Oban.Job.query(state: ~w(completed cancelled))
+
+  Combine multiple filters:
+
+      Oban.Job.query(worker: MyApp.Worker, state: :available, queue: :default)
+
+  Match against `args` or `meta` with JSONB containment:
+
+      Oban.Job.query(args: %{account_id: 1})
+      Oban.Job.query(args: %{account_id: 1, region: "us-east"})
+      Oban.Job.query(args: %{user: %{id: 42}})
+
+  Compose with further `Ecto.Query` calls:
+
+      import Ecto.Query
+
+      [state: :available]
+      |> Oban.Job.query()
+      |> order_by(desc: :id)
+      |> limit(100)
+  """
+  @doc since: "2.22.0"
+  @spec query([{atom(), term()}]) :: Ecto.Query.t()
+  def query(filters) when is_list(filters) do
+    Enum.reduce(filters, __MODULE__, fn {field, value}, query ->
+      validate_filter!(field, value)
+
+      case {field, coerce_value(field, value)} do
+        {field, value} when field in ~w(args meta)a ->
+          where(query, [job], fragment("? @> ?", field(job, ^field), ^value))
+
+        {:tags, value} ->
+          where(query, [job], job.tags == ^value)
+
+        {_field, list} when is_list(list) ->
+          where(query, [job], field(job, ^field) in ^list)
+
+        {_field, value} ->
+          where(query, [job], field(job, ^field) == ^value)
+      end
+    end)
+  end
+
+  defp validate_filter!(field, _value) when field not in @query_fields do
+    raise ArgumentError,
+          "unknown filter field #{inspect(field)}, " <>
+            "expected one of #{inspect(@query_fields)}"
+  end
+
+  defp validate_filter!(field, nil) do
+    raise ArgumentError, "filter #{inspect(field)} values can't be nil"
+  end
+
+  defp validate_filter!(field, value) when field in ~w(args meta)a do
+    cond do
+      is_map(value) and map_size(value) == 0 ->
+        raise ArgumentError, "filter #{inspect(field)} can't be empty"
+
+      is_map(value) ->
+        :ok
+
+      true ->
+        raise ArgumentError, "filter #{inspect(field)} must be a map, got: #{inspect(value)}"
+    end
+  end
+
+  defp validate_filter!(field, []) when field != :tags do
+    raise ArgumentError, "filter #{inspect(field)} can't be an empty list"
+  end
+
+  defp validate_filter!(_field, _value), do: :ok
+
+  defp coerce_value(:worker, value) when is_atom(value), do: inspect(value)
+
+  defp coerce_value(:worker, values) when is_list(values) do
+    Enum.map(values, &coerce_value(:worker, &1))
+  end
+
+  defp coerce_value(field, value) when field in ~w(state queue)a and is_atom(value),
+    do: to_string(value)
+
+  defp coerce_value(field, values) when field in ~w(state queue)a and is_list(values) do
+    Enum.map(values, &coerce_value(field, &1))
+  end
+
+  defp coerce_value(_field, value), do: value
 
   @doc """
   Convert a Job changeset into a map suitable for database insertion.
@@ -481,20 +603,8 @@ defmodule Oban.Job do
   end
 
   @doc false
-  @spec cast_period(unique_period()) :: pos_integer()
-  def cast_period({value, unit}) do
-    unit = to_string(unit)
-
-    cond do
-      unit in ~w(second seconds) -> value
-      unit in ~w(minute minutes) -> value * 60
-      unit in ~w(hour hours) -> value * 60 * 60
-      unit in ~w(day days) -> value * 24 * 60 * 60
-      unit in ~w(week weeks) -> value * 24 * 60 * 60 * 7
-      true -> unit
-    end
-  end
-
+  @spec cast_period(unique_period()) :: pos_integer() | :infinity
+  def cast_period(period) when is_valid_period(period), do: Period.to_seconds(period)
   def cast_period(period), do: period
 
   @doc false
@@ -524,18 +634,23 @@ defmodule Oban.Job do
     end
   end
 
-  defp put_scheduling(changeset, value) do
-    case value do
-      value when is_timestampable(value) ->
-        scheduled_at = to_timestamp(value)
+  defp put_scheduling(changeset, params) do
+    {key, value} =
+      if Map.has_key?(params, :scheduled_in) do
+        {:scheduled_in, params[:scheduled_in]}
+      else
+        {:schedule_in, params[:schedule_in]}
+      end
 
-        put_change(changeset, :scheduled_at, scheduled_at)
+    case value do
+      value when is_integer(value) or is_valid_period(value) ->
+        put_change(changeset, :scheduled_at, to_timestamp(value))
 
       nil ->
         changeset
 
       _ ->
-        add_error(changeset, :schedule_in, "invalid value")
+        add_error(changeset, key, "invalid value")
     end
   end
 
@@ -551,7 +666,12 @@ defmodule Oban.Job do
         put_change(changeset, :unique, unique)
 
       true ->
-        put_change(changeset, :unique, Map.put(@unique_defaults, :period, :infinity))
+        unique =
+          @unique_defaults
+          |> Map.put(:period, :infinity)
+          |> Map.update!(:states, &cast_unique_group/1)
+
+        put_change(changeset, :unique, unique)
 
       value when value in [nil, false] ->
         changeset
@@ -686,14 +806,9 @@ defmodule Oban.Job do
       {:period, :infinity} ->
         :ok
 
-      {:period, {period, unit}} ->
-        if not (is_integer(period) and period > 0 and unit in @time_units) do
-          {:error, "expected :period to be positive and unit to be in #{inspect(@time_units)}"}
-        end
-
       {:period, period} ->
-        if not (is_integer(period) and period > 0) do
-          {:error, "expected :period to be a positive integer"}
+        if not (is_valid_period(period) and Period.to_seconds(period) > 0) do
+          {:error, "expected :period to be a positive integer or {amount, unit} tuple"}
         end
 
       {:states, group} when is_atom(group) ->
@@ -718,6 +833,25 @@ defmodule Oban.Job do
     end)
   end
 
+  @doc false
+  def warn_unique(unique) when is_list(unique) do
+    case Keyword.get(unique, :states) do
+      [_ | _] = states ->
+        if Enum.any?(@insertion_states, &(&1 in states)) do
+          :ok
+        else
+          {:warn,
+           "unique :states #{inspect(states)} doesn't include any insert states " <>
+             "and duplicates won't be detected"}
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  def warn_unique(_), do: :ok
+
   defp validate_keys(keys, unique) do
     fields = Keyword.get(unique, :fields, [])
 
@@ -728,7 +862,7 @@ defmodule Oban.Job do
       not (is_list(keys) and Enum.all?(keys, &is_atom/1)) ->
         {:error, "expected :keys to be a list of atoms"}
 
-      not (is_list(keys) and Enum.any?(@keyable_fields, &(&1 in fields))) ->
+      not Enum.any?(@keyable_fields, &(&1 in fields)) ->
         {:error,
          "using :keys expects :fields to contain at least one of #{inspect(@keyable_fields)}"}
 

@@ -40,7 +40,7 @@ defmodule Oban.WorkerTest do
       priority: 1,
       replace: [available: [:scheduled_at], scheduled: [:scheduled_at]],
       tags: ["scheduled", "special"],
-      unique: [fields: [:queue, :worker], period: {1, :minute}, states: [:scheduled]]
+      unique: [fields: [:queue, :worker], period: {1, :minute}, states: :scheduled]
 
     @impl Worker
     def perform(%{attempt: attempt}) when attempt > 1, do: attempt
@@ -101,6 +101,23 @@ defmodule Oban.WorkerTest do
   describe "timeout/1" do
     test "the default timeout is infinity" do
       assert BasicWorker.timeout(%Job{}) == :infinity
+    end
+  end
+
+  describe "__opts__/0" do
+    test "returns only the worker name with default options" do
+      assert BasicWorker.__opts__() == [worker: "Oban.WorkerTest.BasicWorker"]
+    end
+
+    test "returns all configured options along with the worker name" do
+      opts = CustomWorker.__opts__()
+
+      assert opts
+             |> Keyword.keys()
+             |> Enum.sort() == ~w(max_attempts priority queue replace tags unique worker)a
+
+      assert opts[:worker] == "Oban.WorkerTest.CustomWorker"
+      assert opts[:queue] == "special"
     end
   end
 
@@ -195,6 +212,19 @@ defmodule Oban.WorkerTest do
         def perform(_), do: :ok
       end
     end
+  end
+
+  test "warning on unique :states without an insert state at compile time" do
+    warning =
+      ExUnit.CaptureIO.capture_io(:stderr, fn ->
+        defmodule NoInsertUniqueStates do
+          use Oban.Worker, unique: [states: [:completed]]
+
+          def perform(_), do: :ok
+        end
+      end)
+
+    assert warning =~ "warning:"
   end
 
   test "validating the unique options provided to __using__" do

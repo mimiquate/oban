@@ -2,7 +2,7 @@ defmodule Oban.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/oban-bg/oban"
-  @version "2.20.1"
+  @version "2.24.2"
 
   def project do
     [
@@ -13,7 +13,6 @@ defmodule Oban.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       aliases: aliases(),
-      xref: [exclude: [Postgrex.Error, MyXQL.Error]],
 
       # Hex
       package: package(),
@@ -34,10 +33,11 @@ defmodule Oban.MixProject do
         main: "Oban",
         api_reference: false,
         logo: "assets/oban-logo.svg",
+        assets: %{"assets" => "assets"},
         source_ref: "v#{@version}",
         source_url: @source_url,
         extra_section: "GUIDES",
-        formatters: ["html"],
+        formatters: ["html", "markdown"],
         extras: extras(),
         groups_for_extras: groups_for_extras(),
         groups_for_modules: groups_for_modules(),
@@ -47,7 +47,15 @@ defmodule Oban.MixProject do
   end
 
   def cli do
-    [preferred_envs: [bench: :test, "test.ci": :test, "test.reset": :test, "test.setup": :test]]
+    [
+      preferred_envs: [
+        bench: :test,
+        precommit: :test,
+        "test.ci": :test,
+        "test.reset": :test,
+        "test.setup": :test
+      ]
+    ]
   end
 
   def application do
@@ -92,6 +100,8 @@ defmodule Oban.MixProject do
       "guides/upgrading/v2.14.md",
       "guides/upgrading/v2.17.md",
       "guides/upgrading/v2.20.md",
+      "guides/upgrading/v2.21.md",
+      "guides/upgrading/v2.24.md",
 
       # Recipes
       "guides/recipes/recursive-jobs.md",
@@ -124,35 +134,45 @@ defmodule Oban.MixProject do
 
   defp groups_for_modules do
     [
-      Plugins: [
-        Oban.Plugin,
-        Oban.Plugins.Cron,
-        Oban.Plugins.Lifeline,
-        Oban.Plugins.Pruner,
-        Oban.Plugins.Reindexer
-      ],
-      Extending: [
-        Oban.Config,
-        Oban.Registry,
-        Oban.Repo,
-        Oban.Telemetry
-      ],
-      Notifiers: [
-        Oban.Notifier,
-        Oban.Notifiers.Postgres,
-        Oban.Notifiers.PG
-      ],
-      Peers: [
-        Oban.Peer,
-        Oban.Peers.Database,
-        Oban.Peers.Global
+      Services: [
+        Oban.Cron,
+        Oban.Lifeline,
+        Oban.Pruner,
+        Oban.Queues,
+        Oban.Reindexer
       ],
       Engines: [
-        Oban.Engine,
         Oban.Engines.Basic,
         Oban.Engines.Dolphin,
         Oban.Engines.Inline,
         Oban.Engines.Lite
+      ],
+      Notifiers: [
+        Oban.Notifiers.Postgres,
+        Oban.Notifiers.PG
+      ],
+      Peers: [
+        Oban.Peers.Database,
+        Oban.Peers.Global
+      ],
+      Extending: [
+        Oban.Config,
+        Oban.Engine,
+        Oban.Plugin,
+        Oban.Registry,
+        Oban.Repo,
+        Oban.Telemetry
+      ],
+      Exceptions: [
+        Oban.CrashError,
+        Oban.PerformError,
+        Oban.TimeoutError
+      ],
+      Deprecated: [
+        Oban.Plugins.Cron,
+        Oban.Plugins.Lifeline,
+        Oban.Plugins.Pruner,
+        Oban.Plugins.Reindexer
       ]
     ]
   end
@@ -188,7 +208,7 @@ defmodule Oban.MixProject do
       {:benchee, "~> 1.4", only: [:test, :dev], runtime: false},
       {:credo, "~> 1.7", only: [:test, :dev], runtime: false},
       {:dialyxir, "~> 1.4", only: [:test, :dev], runtime: false},
-      {:ex_doc, "~> 0.38", only: [:test, :dev], runtime: false},
+      {:ex_doc, "~> 0.40.4", only: [:test, :dev], runtime: false},
       {:makeup_diff, "~> 0.1", only: [:test, :dev], runtime: false}
     ]
   end
@@ -196,6 +216,12 @@ defmodule Oban.MixProject do
   defp aliases do
     [
       bench: "run bench/bench_helper.exs",
+      precommit: [
+        "format --check-formatted",
+        "deps.unlock --check-unused",
+        "credo --strict",
+        "test --raise"
+      ],
       release: [
         "cmd git tag v#{@version}",
         "cmd git push",

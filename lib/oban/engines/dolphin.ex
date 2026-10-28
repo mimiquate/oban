@@ -22,6 +22,9 @@ defmodule Oban.Engines.Dolphin do
   alias Oban.{Config, Engine, Job, Repo}
   alias Oban.Engines.Basic
 
+  @acking_states ["executing"]
+  @cancel_states ["executing", "cancelled"]
+
   defmacrop json_push(column, value) do
     quote do
       fragment("json_array_append(?, '$', ?)", unquote(column), unquote(value))
@@ -105,14 +108,25 @@ defmodule Oban.Engines.Dolphin do
         at = utc_now()
         by = [meta.node, meta.uuid]
 
-        updates = [
-          set: [state: "executing", attempted_at: at, attempted_by: by],
-          inc: [attempt: 1]
-        ]
-
         # MySQL doesn't support selecting in an update. To accomplish the required functionality
         # we have to select, then update.
-        Repo.update_all(conf, where(Job, [j], j.id in ^Enum.map(jobs, & &1.id)), updates)
+        if Enum.any?(jobs) do
+          ids = Enum.map(jobs, & &1.id)
+
+          # MySQL may scan the whole table when the ids cover most of it or statistics
+          # underestimate the table, which locks rows held by other producers and deadlocks.
+          # Reading the fetched ids first and forcing the primary key makes it look up each job.
+          # Ecto can't express this, so it's literal SQL.
+          update = """
+          UPDATE JSON_TABLE(?, '$[*]' COLUMNS (id BIGINT PATH '$')) AS fetched
+          STRAIGHT_JOIN oban_jobs FORCE INDEX (PRIMARY) ON fetched.id = oban_jobs.id
+          SET state = 'executing', attempted_at = ?, attempted_by = ?, attempt = attempt + 1
+          """
+
+          params = [Oban.JSON.encode!(ids), at, Oban.JSON.encode!(by)]
+
+          Repo.query!(conf, update, params, cache_statement: "oban_fetch_jobs")
+        end
 
         Enum.map(
           jobs,
@@ -203,8 +217,8 @@ defmodule Oban.Engines.Dolphin do
   @impl Engine
   def discard_job(%Config{} = conf, job) do
     query =
-      Job
-      |> where(id: ^job.id)
+      job
+      |> ack_query(@acking_states)
       |> update([j],
         set: [
           state: "discarded",
@@ -221,8 +235,8 @@ defmodule Oban.Engines.Dolphin do
   @impl Engine
   def error_job(%Config{} = conf, job, seconds) do
     query =
-      Job
-      |> where(id: ^job.id)
+      job
+      |> ack_query(@acking_states)
       |> update([j],
         set: [
           state: "retryable",
@@ -237,26 +251,53 @@ defmodule Oban.Engines.Dolphin do
   end
 
   @impl Engine
-  defdelegate snooze_job(conf, job, seconds), to: Basic
+  def snooze_job(%Config{} = conf, job, seconds) do
+    query =
+      job
+      |> ack_query(@acking_states)
+      |> update([j],
+        set: [
+          state: "scheduled",
+          scheduled_at: ^seconds_from_now(seconds),
+          meta:
+            fragment(
+              "json_set(?, '$.snoozed', coalesce(cast(json_extract(?, '$.snoozed') AS signed), 0) + 1)",
+              j.meta,
+              j.meta
+            )
+        ],
+        inc: [attempt: -1]
+      )
+
+    Repo.update_all(conf, query, [])
+
+    :ok
+  end
 
   @impl Engine
-  def cancel_job(%Config{} = conf, job) do
-    query = where(Job, id: ^job.id)
-
+  def cancel_job(%Config{} = conf, %Job{unsaved_error: unsaved} = job) when is_map(unsaved) do
     query =
-      if is_map(job.unsaved_error) do
-        update(query, [j],
-          set: [
-            state: "cancelled",
-            cancelled_at: ^utc_now(),
-            errors: json_push(j.errors, ^Job.format_attempt(job))
-          ]
-        )
-      else
-        query
-        |> where([j], j.state not in ~w(cancelled completed discarded))
-        |> update(set: [state: "cancelled", cancelled_at: ^utc_now()])
-      end
+      job
+      |> ack_query(@cancel_states)
+      |> update([j],
+        set: [
+          state: "cancelled",
+          cancelled_at: ^utc_now(),
+          errors: json_push(j.errors, ^Job.format_attempt(job))
+        ]
+      )
+
+    Repo.update_all(conf, query, [])
+
+    :ok
+  end
+
+  def cancel_job(%Config{} = conf, job) do
+    query =
+      Job
+      |> where(id: ^job.id)
+      |> where([j], j.state not in ~w(cancelled completed discarded))
+      |> update(set: [state: "cancelled", cancelled_at: ^utc_now()])
 
     Repo.update_all(conf, query, [])
 
@@ -420,6 +461,13 @@ defmodule Oban.Engines.Dolphin do
         |> Map.new(fn {key, val} -> {to_string(key), val} end)
         |> Map.take(keys)
     end
+  end
+
+  defp ack_query(%Job{} = job, states) do
+    Job
+    |> where([j], j.id == ^job.id)
+    |> where([j], j.state in ^states)
+    |> where([j], j.attempted_at == ^job.attempted_at)
   end
 
   defp seconds_from_now(seconds), do: DateTime.add(utc_now(), seconds, :second)

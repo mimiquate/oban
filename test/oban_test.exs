@@ -37,7 +37,7 @@ defmodule ObanTest do
         start_supervised_oban!(
           queues: [alpha: 1],
           shutdown_grace_period: 10,
-          stage_interval: 10
+          stager: [interval: 5]
         )
 
       assert_receive {:started, 1}
@@ -59,7 +59,7 @@ defmodule ObanTest do
         start_supervised_oban!(
           queues: [alpha: 1],
           shutdown_grace_period: 10,
-          stage_interval: 10
+          stager: [interval: 5]
         )
 
       assert_receive {:started, 1}
@@ -80,7 +80,7 @@ defmodule ObanTest do
         start_supervised_oban!(
           queues: [alpha: 1, omega: 1],
           shutdown_grace_period: 10,
-          stage_interval: 10
+          stager: [interval: 5]
         )
 
       assert_receive {:started, 1}
@@ -99,7 +99,7 @@ defmodule ObanTest do
       name =
         start_supervised_oban!(
           queues: [alpha: 1, gamma: 2, delta: [limit: 2, paused: true]],
-          stage_interval: 5
+          stager: [interval: 5]
         )
 
       insert!([ref: 1, sleep: 500], queue: :alpha)
@@ -263,14 +263,14 @@ defmodule ObanTest do
     end
 
     test "pausing queues only on the local node" do
-      name1 = start_supervised_oban!(stage_interval: 10, queues: [alpha: 1])
-      name2 = start_supervised_oban!(stage_interval: 10, queues: [alpha: 1])
+      name_1 = start_supervised_oban!(stager: [interval: 5], queues: [alpha: 1])
+      name_2 = start_supervised_oban!(stager: [interval: 5], queues: [alpha: 1])
 
-      assert :ok = Oban.pause_queue(name2, queue: :alpha, local_only: true)
+      assert :ok = Oban.pause_queue(name_2, queue: :alpha, local_only: true)
 
       with_backoff(fn ->
-        assert %{paused: false} = Oban.check_queue(name1, queue: :alpha)
-        assert %{paused: true} = Oban.check_queue(name2, queue: :alpha)
+        assert %{paused: false} = Oban.check_queue(name_1, queue: :alpha)
+        assert %{paused: true} = Oban.check_queue(name_2, queue: :alpha)
       end)
     end
 
@@ -291,23 +291,23 @@ defmodule ObanTest do
     end
 
     test "resuming queues only on the local node" do
-      opts = [notifier: Oban.Notifiers.PG, stage_interval: 10, queues: [alpha: 1]]
+      opts = [notifier: Oban.Notifiers.PG, stager: [interval: 5], queues: [alpha: 1]]
 
-      name1 = start_supervised_oban!(opts)
-      name2 = start_supervised_oban!(opts)
+      name_1 = start_supervised_oban!(opts)
+      name_2 = start_supervised_oban!(opts)
 
-      assert :ok = Oban.pause_queue(name1, queue: :alpha)
+      assert :ok = Oban.pause_queue(name_1, queue: :alpha)
 
       with_backoff(fn ->
-        assert %{paused: true} = Oban.check_queue(name1, queue: :alpha)
-        assert %{paused: true} = Oban.check_queue(name2, queue: :alpha)
+        assert %{paused: true} = Oban.check_queue(name_1, queue: :alpha)
+        assert %{paused: true} = Oban.check_queue(name_2, queue: :alpha)
       end)
 
-      assert :ok = Oban.resume_queue(name1, queue: :alpha, local_only: true)
+      assert :ok = Oban.resume_queue(name_1, queue: :alpha, local_only: true)
 
       with_backoff(fn ->
-        assert %{paused: false} = Oban.check_queue(name1, queue: :alpha)
-        assert %{paused: true} = Oban.check_queue(name2, queue: :alpha)
+        assert %{paused: false} = Oban.check_queue(name_1, queue: :alpha)
+        assert %{paused: true} = Oban.check_queue(name_2, queue: :alpha)
       end)
     end
 
@@ -378,28 +378,28 @@ defmodule ObanTest do
     test "pausing and resuming all local queues" do
       opts = [queues: [alpha: 1, gamma: 1]]
 
-      name1 = start_supervised_oban!(opts)
-      name2 = start_supervised_oban!(opts)
+      name_1 = start_supervised_oban!(opts)
+      name_2 = start_supervised_oban!(opts)
 
-      assert :ok = Oban.pause_all_queues(name1, local_only: true)
+      assert :ok = Oban.pause_all_queues(name_1, local_only: true)
 
       with_backoff(fn ->
-        assert %{paused: true} = Oban.check_queue(name1, queue: :alpha)
-        assert %{paused: true} = Oban.check_queue(name1, queue: :gamma)
+        assert %{paused: true} = Oban.check_queue(name_1, queue: :alpha)
+        assert %{paused: true} = Oban.check_queue(name_1, queue: :gamma)
 
-        assert %{paused: false} = Oban.check_queue(name2, queue: :alpha)
-        assert %{paused: false} = Oban.check_queue(name2, queue: :gamma)
+        assert %{paused: false} = Oban.check_queue(name_2, queue: :alpha)
+        assert %{paused: false} = Oban.check_queue(name_2, queue: :gamma)
       end)
 
-      assert :ok = Oban.pause_all_queues(name2, local_only: true)
-      assert :ok = Oban.resume_all_queues(name1, local_only: true)
+      assert :ok = Oban.pause_all_queues(name_2, local_only: true)
+      assert :ok = Oban.resume_all_queues(name_1, local_only: true)
 
       with_backoff(fn ->
-        assert %{paused: false} = Oban.check_queue(name1, queue: :alpha)
-        assert %{paused: false} = Oban.check_queue(name1, queue: :gamma)
+        assert %{paused: false} = Oban.check_queue(name_1, queue: :alpha)
+        assert %{paused: false} = Oban.check_queue(name_1, queue: :gamma)
 
-        assert %{paused: true} = Oban.check_queue(name2, queue: :alpha)
-        assert %{paused: true} = Oban.check_queue(name2, queue: :gamma)
+        assert %{paused: true} = Oban.check_queue(name_2, queue: :alpha)
+        assert %{paused: true} = Oban.check_queue(name_2, queue: :gamma)
       end)
     end
   end
@@ -437,14 +437,14 @@ defmodule ObanTest do
     end
 
     test "scaling queues only on the local node" do
-      name1 = start_supervised_oban!(queues: [alpha: 2])
-      name2 = start_supervised_oban!(queues: [alpha: 2])
+      name_1 = start_supervised_oban!(queues: [alpha: 2])
+      name_2 = start_supervised_oban!(queues: [alpha: 2])
 
-      assert :ok = Oban.scale_queue(name2, queue: :alpha, limit: 1, local_only: true)
+      assert :ok = Oban.scale_queue(name_2, queue: :alpha, limit: 1, local_only: true)
 
       with_backoff(fn ->
-        assert %{limit: 2} = Oban.check_queue(name1, queue: :alpha)
-        assert %{limit: 1} = Oban.check_queue(name2, queue: :alpha)
+        assert %{limit: 2} = Oban.check_queue(name_1, queue: :alpha)
+        assert %{limit: 1} = Oban.check_queue(name_2, queue: :alpha)
       end)
     end
 
@@ -482,33 +482,52 @@ defmodule ObanTest do
       assert_invalid_opts(name, :start_queue, [])
       assert_invalid_opts(name, :start_queue, queue: nil)
       assert_invalid_opts(name, :start_queue, limit: -1)
+      assert_invalid_opts(name, :start_queue, limit: 1, dispatch_cooldown: 0)
       assert_invalid_opts(name, :start_queue, local_only: -1)
       assert_invalid_opts(name, :start_queue, wat: -1)
     end
 
-    test "starting individual queues dynamically" do
+    test "starting queues dynamically" do
       name = start_supervised_oban!(queues: [alpha: 9])
 
       assert :ok = Oban.start_queue(name, queue: :gamma, limit: 5, refresh_interval: 10)
       assert :ok = Oban.start_queue(name, queue: :delta, limit: 6, paused: true)
+      assert :ok = Oban.start_queue(name, queue: :epsilon, limit: 5, dispatch_cooldown: 50)
       assert :ok = Oban.start_queue(name, queue: :alpha, limit: 5)
 
       with_backoff(fn ->
         assert supervised_queue?(name, "alpha")
         assert supervised_queue?(name, "delta")
+        assert supervised_queue?(name, "epsilon")
         assert supervised_queue?(name, "gamma")
+      end)
+
+      producer = Registry.whereis(name, {:producer, "epsilon"})
+
+      assert %{dispatch_cooldown: 50} = :sys.get_state(producer)
+    end
+
+    test "starting queues only on the local node" do
+      name_1 = start_supervised_oban!(queues: [])
+      name_2 = start_supervised_oban!(queues: [])
+
+      assert :ok = Oban.start_queue(name_1, queue: :alpha, limit: 1, local_only: true)
+
+      with_backoff(fn ->
+        assert supervised_queue?(name_1, "alpha")
+        refute supervised_queue?(name_2, "alpha")
       end)
     end
 
-    test "starting individual queues only on the local node" do
-      name1 = start_supervised_oban!(queues: [])
-      name2 = start_supervised_oban!(queues: [])
+    test "starting queues on a specific node" do
+      name_1 = start_supervised_oban!(node: "worker.1", queues: [])
+      name_2 = start_supervised_oban!(node: "worker.2", queues: [])
 
-      assert :ok = Oban.start_queue(name1, queue: :alpha, limit: 1, local_only: true)
+      assert :ok = Oban.start_queue(name_1, queue: :alpha, limit: 1, node: "worker.1")
 
       with_backoff(fn ->
-        assert supervised_queue?(name1, "alpha")
-        refute supervised_queue?(name2, "alpha")
+        assert supervised_queue?(name_1, "alpha")
+        refute supervised_queue?(name_2, "alpha")
       end)
     end
   end
@@ -538,14 +557,14 @@ defmodule ObanTest do
     end
 
     test "stopping individual queues only on the local node" do
-      name1 = start_supervised_oban!(queues: [alpha: 1])
-      name2 = start_supervised_oban!(queues: [alpha: 1])
+      name_1 = start_supervised_oban!(queues: [alpha: 1])
+      name_2 = start_supervised_oban!(queues: [alpha: 1])
 
-      assert :ok = Oban.stop_queue(name2, queue: :alpha, local_only: true)
+      assert :ok = Oban.stop_queue(name_2, queue: :alpha, local_only: true)
 
       with_backoff(fn ->
-        assert supervised_queue?(name1, "alpha")
-        refute supervised_queue?(name2, "alpha")
+        assert supervised_queue?(name_1, "alpha")
+        refute supervised_queue?(name_2, "alpha")
       end)
     end
 
@@ -583,17 +602,13 @@ defmodule ObanTest do
       use Oban, otp_app: :oban, repo: Oban.Test.Repo
     end
 
-    start_supervised!({MyOban, testing: :inline})
+    start_supervised!({MyOban, testing: :manual})
 
     assert %{name: MyOban, repo: Oban.Test.Repo} = MyOban.config()
   end
 
-  defp start_supervised_oban(context) do
-    name =
-      context
-      |> Map.get(:oban_opts, [])
-      |> Keyword.put_new(:testing, :manual)
-      |> start_supervised_oban!()
+  defp start_supervised_oban(_context) do
+    name = start_supervised_oban!(testing: :manual)
 
     {:ok, name: name}
   end

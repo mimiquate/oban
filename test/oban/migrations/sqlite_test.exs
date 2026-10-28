@@ -1,6 +1,8 @@
 defmodule Oban.Migrations.SQLiteTest do
   use Oban.Case, async: true
 
+  @moduletag :lite
+
   defmodule MigrationRepo do
     @moduledoc false
 
@@ -13,8 +15,6 @@ defmodule Oban.Migrations.SQLiteTest do
     end
   end
 
-  @moduletag :lite
-
   defmodule Migration do
     use Ecto.Migration
 
@@ -24,6 +24,14 @@ defmodule Oban.Migrations.SQLiteTest do
 
     def down do
       Oban.Migration.down()
+    end
+  end
+
+  test "verifying that any migrations have ran" do
+    start_supervised!(MigrationRepo)
+
+    assert_raise RuntimeError, ~r/migrations have not been run/, fn ->
+      start_supervised_oban!(repo: MigrationRepo, testing: :manual)
     end
   end
 

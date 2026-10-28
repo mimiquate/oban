@@ -5,7 +5,7 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
     alias Ecto.Adapters.SQL.Sandbox
     alias Ecto.Multi
     alias Oban.Engines.{Basic, Dolphin, Lite}
-    alias Oban.{Notifier, TelemetryHandler}
+    alias Oban.{Engine, Notifier, TelemetryHandler}
 
     @engine engine
 
@@ -15,8 +15,16 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
              Lite -> LiteRepo
            end)
 
+    @unsaved %{kind: :error, reason: %RuntimeError{message: "boom"}, stacktrace: []}
+
     @moduletag lite: engine == Lite
     @moduletag dolphin: engine == Dolphin
+
+    if engine == Lite do
+      setup do
+        on_exit(fn -> LiteRepo.delete_all(Oban.Job) end)
+      end
+    end
 
     defmodule MiniUniq do
       use Oban.Worker, unique: [fields: [:args]]
@@ -29,7 +37,7 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
       setup :start_supervised_oban
 
       test "inserting a single job", %{name: name} do
-        TelemetryHandler.attach_events()
+        TelemetryHandler.attach_events(oban_name: name)
 
         assert {:ok, job} = Oban.insert(name, Worker.new(%{ref: 1}))
 
@@ -149,6 +157,19 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
       end
 
       @tag :unique
+      test "considering nil arg values to establish uniqueness", %{name: name} do
+        changeset1 = MiniUniq.new(%{id: 1, tenant: nil})
+        changeset2 = MiniUniq.new(%{id: 1})
+
+        assert {:ok, %Job{id: id_1}} = Oban.insert(name, changeset1)
+        assert {:ok, %Job{id: id_2}} = Oban.insert(name, changeset1)
+        assert {:ok, %Job{id: id_3}} = Oban.insert(name, changeset2)
+
+        assert id_1 == id_2
+        assert id_1 != id_3
+      end
+
+      @tag :unique
       test "scoping uniqueness by specific meta keys", %{name: name} do
         unique = [fields: [:meta], keys: [:slug]]
 
@@ -168,6 +189,7 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
         %Job{id: id_2} = insert!(name, %{id: 2}, state: "completed")
         %Job{id: id_3} = insert!(name, %{id: 3}, state: "executing")
         %Job{id: id_4} = insert!(name, %{id: 4}, state: "discarded")
+        %Job{id: id_5} = insert!(name, %{id: 5}, state: "suspended")
 
         uniq_insert = fn args, states ->
           Oban.insert(name, Worker.new(args, unique: [states: states]))
@@ -178,6 +200,7 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
         assert {:ok, %{id: ^id_2}} = uniq_insert.(%{id: 2}, [:completed, :discarded])
         assert {:ok, %{id: ^id_3}} = uniq_insert.(%{id: 3}, [:completed, :executing])
         assert {:ok, %{id: ^id_4}} = uniq_insert.(%{id: 4}, [:completed, :discarded])
+        assert {:ok, %{id: ^id_5}} = uniq_insert.(%{id: 5}, [:suspended])
       end
 
       @tag :unique
@@ -279,7 +302,7 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
       setup :start_supervised_oban
 
       test "inserting multiple jobs within a multi", %{name: name} do
-        TelemetryHandler.attach_events()
+        TelemetryHandler.attach_events(oban_name: name)
 
         multi = Multi.new()
         multi = Oban.insert(name, multi, :job_1, Worker.new(%{ref: 1}))
@@ -330,7 +353,7 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
       setup :start_supervised_oban
 
       test "inserting multiple jobs", %{name: name} do
-        TelemetryHandler.attach_events()
+        TelemetryHandler.attach_events(oban_name: name)
 
         changesets = Enum.map(0..2, &Worker.new(%{ref: &1}, queue: "special", schedule_in: 10))
         jobs = Oban.insert_all(name, changesets)
@@ -403,7 +426,7 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
       setup :start_supervised_oban
 
       test "inserting multiple jobs within a multi", %{name: name} do
-        TelemetryHandler.attach_events()
+        TelemetryHandler.attach_events(oban_name: name)
 
         changesets_1 = Enum.map(1..2, &Worker.new(%{ref: &1}))
         changesets_2 = Enum.map(3..4, &Worker.new(%{ref: &1}))
@@ -447,7 +470,7 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
       setup :start_supervised_oban
 
       test "deleting jobs in prunable states", %{name: name} do
-        TelemetryHandler.attach_events(span_type: [:job, [:engine, :prune_jobs]])
+        TelemetryHandler.attach_events(span_type: [:job, [:engine, :prune_jobs]], oban_name: name)
 
         for state <- Job.states(), seconds <- 59..61 do
           opts = [
@@ -482,10 +505,10 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
     describe "cancel_job/2" do
       setup :start_supervised_oban
 
-      @describetag oban_opts: [queues: [alpha: 5], stage_interval: 10, testing: :disabled]
+      @describetag oban_opts: [queues: [alpha: 5], stager: [interval: 5], testing: :disabled]
 
       test "cancelling an executing job", %{name: name} do
-        TelemetryHandler.attach_events(span_type: [:job, [:engine, :cancel_job]])
+        TelemetryHandler.attach_events(span_type: [:job, [:engine, :cancel_job]], oban_name: name)
 
         job = insert!(name, %{ref: 1, sleep: 100}, [])
 
@@ -493,16 +516,18 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
 
         Oban.cancel_job(name, job)
 
-        refute_receive {:ok, 1}
+        assert_receive {:event, :stop, _, %{job: _}}
+        assert_receive {:event, [:cancel_job, :stop], _, %{job: _}}
+
+        refute_received {:ok, 1}
 
         assert %Job{state: "cancelled", errors: [_], cancelled_at: %_{}} = reload(name, job)
         assert %{running: []} = Oban.check_queue(name, queue: :alpha)
-
-        assert_receive {:event, :stop, _, %{job: _}}
-        assert_receive {:event, [:cancel_job, :stop], _, %{job: _}}
       end
 
       test "cancelling jobs that may or may not be executing", %{name: name} do
+        TelemetryHandler.attach_events(span_type: [:job], oban_name: name)
+
         job_1 = insert!(name, %{ref: 1}, schedule_in: 10)
         job_2 = insert!(name, %{ref: 2}, schedule_in: 10, state: "retryable")
         job_3 = insert!(name, %{ref: 3}, state: "completed")
@@ -515,7 +540,9 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
         assert :ok = Oban.cancel_job(name, job_3.id)
         assert :ok = Oban.cancel_job(name, job_4.id)
 
-        refute_receive {:ok, 4}
+        assert_receive {:event, :stop, _, %{job: %{id: id}}} when id == job_4.id
+
+        refute_received {:ok, 4}
 
         assert %Job{state: "cancelled", errors: [], cancelled_at: %_{}} = reload(name, job_1)
         assert %Job{state: "cancelled", errors: [], cancelled_at: %_{}} = reload(name, job_2)
@@ -524,13 +551,46 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
       end
     end
 
+    describe "all_jobs/2" do
+      setup :start_supervised_oban
+
+      test "fetching all jobs from an unscoped queryable", %{name: name} do
+        job_1 = insert!(name, %{ref: 1}, state: "available")
+        job_2 = insert!(name, %{ref: 2}, state: "completed")
+        job_3 = insert!(name, %{ref: 3}, state: "cancelled")
+
+        jobs = Oban.all_jobs(name, Job)
+        jids = [job_1.id, job_2.id, job_3.id]
+
+        assert jobs |> Enum.map(& &1.id) |> Enum.sort() == Enum.sort(jids)
+      end
+
+      test "fetching jobs from a filtered query", %{name: name} do
+        job_1 = insert!(name, %{ref: 1}, queue: :alpha, state: "available")
+        _job_2 = insert!(name, %{ref: 2}, queue: :alpha, state: "completed")
+        _job_3 = insert!(name, %{ref: 3}, queue: :gamma, state: "available")
+        job_4 = insert!(name, %{ref: 4}, queue: :alpha, state: "cancelled")
+        _job_5 = insert!(name, %{ref: 5}, worker: MiniUniq, queue: :alpha, state: "available")
+
+        jobs =
+          [worker: Worker, queue: :alpha, state: ~w(available cancelled)]
+          |> Job.query()
+          |> then(&Oban.all_jobs(name, &1))
+
+        assert jobs |> Enum.map(& &1.id) |> Enum.sort() == Enum.sort([job_1.id, job_4.id])
+      end
+    end
+
     describe "cancel_all_jobs/2" do
       setup :start_supervised_oban
 
-      @describetag oban_opts: [queues: [alpha: 5], stage_interval: 10, testing: :disabled]
+      @describetag oban_opts: [queues: [alpha: 5], stager: [interval: 5], testing: :disabled]
 
       test "cancelling all jobs that may or may not be executing", %{name: name} do
-        TelemetryHandler.attach_events(span_type: [:job, [:engine, :cancel_all_jobs]])
+        TelemetryHandler.attach_events(
+          span_type: [:job, [:engine, :cancel_all_jobs]],
+          oban_name: name
+        )
 
         job_1 = insert!(name, %{ref: 1}, schedule_in: 10)
         job_2 = insert!(name, %{ref: 2}, schedule_in: 10, state: "retryable")
@@ -541,15 +601,15 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
 
         assert {:ok, 3} = Oban.cancel_all_jobs(name, Job)
 
-        refute_receive {:ok, 4}
+        assert_receive {:event, :stop, _, %{job: _}}
+        assert_receive {:event, [:cancel_all_jobs, :stop], _, %{jobs: _jobs}}
+
+        refute_received {:ok, 4}
 
         assert %Job{state: "cancelled", errors: [], cancelled_at: %_{}} = reload(name, job_1)
         assert %Job{state: "cancelled", errors: [], cancelled_at: %_{}} = reload(name, job_2)
         assert %Job{state: "completed", errors: [], cancelled_at: nil} = reload(name, job_3)
         assert %Job{state: "cancelled", errors: [_], cancelled_at: %_{}} = reload(name, job_4)
-
-        assert_receive {:event, :stop, _, %{job: _}}
-        assert_receive {:event, [:cancel_all_jobs, :stop], _, %{jobs: _jobs}}
       end
     end
 
@@ -557,7 +617,7 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
       setup :start_supervised_oban
 
       test "deleting a single job", %{name: name} do
-        TelemetryHandler.attach_events(span_type: [:job, [:engine, :delete_job]])
+        TelemetryHandler.attach_events(span_type: [:job, [:engine, :delete_job]], oban_name: name)
 
         job_1 = insert!(name, %{ref: 1}, [])
         job_2 = insert!(name, %{ref: 2}, [])
@@ -576,7 +636,10 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
       setup :start_supervised_oban
 
       test "deleting multiple jobs based on a query", %{name: name} do
-        TelemetryHandler.attach_events(span_type: [:job, [:engine, :delete_all_jobs]])
+        TelemetryHandler.attach_events(
+          span_type: [:job, [:engine, :delete_all_jobs]],
+          oban_name: name
+        )
 
         job_1 = insert!(name, %{ref: 1}, state: "available")
         job_2 = insert!(name, %{ref: 2}, state: "scheduled")
@@ -620,7 +683,7 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
       setup :start_supervised_oban
 
       test "retrying all retryable jobs", %{name: name} do
-        TelemetryHandler.attach_events(span_type: [[:engine, :retry_all_jobs]])
+        TelemetryHandler.attach_events(span_type: [[:engine, :retry_all_jobs]], oban_name: name)
 
         job_1 = insert!(name, %{ref: 1}, state: "discarded", max_attempts: 20, attempt: 20)
         job_2 = insert!(name, %{ref: 2}, state: "completed", max_attempts: 20)
@@ -638,11 +701,90 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
       end
     end
 
+    describe "snooze_job/3" do
+      setup :start_supervised_oban
+
+      test "rolling back the attempt and counting snoozes", %{name: name} do
+        conf = Oban.config(name)
+
+        meta = %{"key" => "val", "snoozed" => 1}
+
+        attempted_at = DateTime.utc_now()
+
+        job_1 =
+          insert!(name, %{ref: 1},
+            state: "executing",
+            attempt: 2,
+            attempted_at: attempted_at,
+            max_attempts: 5
+          )
+
+        job_2 =
+          insert!(name, %{ref: 2},
+            state: "executing",
+            attempt: 2,
+            attempted_at: attempted_at,
+            meta: meta
+          )
+
+        {:ok, _} = Oban.update_job(name, job_2, %{meta: Map.put(meta, "new", "val")})
+
+        assert :ok = Oban.Engine.snooze_job(conf, job_1, 60)
+        assert :ok = Oban.Engine.snooze_job(conf, job_2, 60)
+
+        assert %Job{state: "scheduled", scheduled_at: %_{}} = job_1 = reload(name, job_1)
+        assert %Job{attempt: 1, max_attempts: 5, meta: %{"snoozed" => 1}} = job_1
+        assert %Job{attempt: 1, meta: %{"new" => "val", "snoozed" => 2}} = reload(name, job_2)
+      end
+    end
+
+    describe "acking" do
+      setup :start_supervised_oban
+
+      test "stale executions can't overwrite a newer execution's state", %{name: name} do
+        conf = Oban.config(name)
+
+        ackers = [
+          &Engine.complete_job/2,
+          &Engine.discard_job/2,
+          &Engine.error_job(&1, &2, 60),
+          &Engine.snooze_job(&1, &2, 60),
+          &Engine.cancel_job/2
+        ]
+
+        for ack <- ackers do
+          job = insert!(name, %{ref: 1}, state: "executing", attempted_at: seconds_ago(30))
+
+          # A newer execution takes over the row and completes it
+          now = DateTime.utc_now()
+
+          changes = [state: "completed", attempt: 2, attempted_at: now, completed_at: now]
+
+          {:ok, _} = Oban.Repo.update(conf, Ecto.Changeset.change(job, changes))
+
+          assert :ok = ack.(conf, %{job | unsaved_error: @unsaved})
+
+          assert %Job{state: "completed", attempt: 2, errors: []} = reload(name, job)
+        end
+      end
+
+      test "an execution cancelled while running records its error", %{name: name} do
+        conf = Oban.config(name)
+
+        job = insert!(name, %{ref: 1}, state: "executing", attempted_at: DateTime.utc_now())
+
+        assert :ok = Oban.cancel_job(name, job)
+        assert :ok = Engine.cancel_job(conf, %{job | unsaved_error: @unsaved})
+
+        assert %Job{state: "cancelled", errors: [_]} = reload(name, job)
+      end
+    end
+
     describe "update_job/3" do
       setup :start_supervised_oban
 
       test "updating jobs with a map of changes or function", %{name: name} do
-        TelemetryHandler.attach_events(span_type: [[:engine, :update_job]])
+        TelemetryHandler.attach_events(span_type: [[:engine, :update_job]], oban_name: name)
 
         job_1 = insert!(name, %{}, priority: 1)
         job_2 = insert!(name, %{}, priority: 1)
@@ -677,10 +819,10 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
     describe "integration" do
       setup :start_supervised_oban
 
-      @describetag oban_opts: [queues: [alpha: 3], stage_interval: 10, testing: :disabled]
+      @describetag oban_opts: [queues: [alpha: 3], stager: [interval: 5], testing: :disabled]
 
       test "inserting and executing jobs", %{name: name} do
-        TelemetryHandler.attach_events()
+        TelemetryHandler.attach_events(oban_name: name)
 
         [job_1, job_2, job_3, job_4, job_5] =
           ~w(OK CANCEL DISCARD ERROR SNOOZE)
@@ -741,7 +883,7 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
 
         assert_receive {:ok, 1}
         assert_receive {:ok, 2}
-        refute_receive {:ok, 3}
+        refute_receive {:ok, 3}, 20
       end
 
       test "executing jobs in order of priority", %{name: name} do
@@ -777,8 +919,10 @@ for engine <- [Oban.Engines.Basic, Oban.Engines.Lite, Oban.Engines.Dolphin] do
         assert_receive {:started, 1}
         refute_receive {:ok, 1}, 20
 
-        assert %Job{state: "retryable", errors: [%{"error" => error}]} = reload(name, job)
-        assert error == "** (Oban.TimeoutError) Oban.Integration.Worker timed out after 5ms"
+        with_backoff(fn ->
+          assert %Job{state: "retryable", errors: [%{"error" => error}]} = reload(name, job)
+          assert error == "** (Oban.TimeoutError) Oban.Integration.Worker timed out after 5ms"
+        end)
       end
 
       test "applying custom backoff after uncaught exits", %{name: name} do

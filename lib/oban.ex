@@ -15,9 +15,11 @@ defmodule Oban do
 
   use Supervisor
 
+  import Ecto.Query, only: [where: 2]
+
   alias Ecto.{Changeset, Multi}
   alias Oban.{Config, Engine, Harbor, Job, Notifier, Nursery, Peer, Registry, Repo, Sonar}
-  alias Oban.Queue.{Drainer, Producer}
+  alias Oban.Queues.{Drainer, Producer}
 
   @typedoc """
   The name of an Oban instance. This is used to identify instances in the internal registry for
@@ -68,25 +70,39 @@ defmodule Oban do
         }
 
   @typedoc """
+  The value accepted by a service key (`:cron`, `:pruner`, `:lifeline`, `:reindexer`, `:stager`).
+
+  Either `false` to disable, a keyword list of options for the default implementation, a module to
+  use an alternative implementation with default options, or a `{module, options}` tuple to use an
+  alternative implementation with options.
+  """
+  @type service :: false | module() | Keyword.t() | {module(), Keyword.t()}
+
+  @typedoc """
   Configuration options for starting an Oban instance.
 
-  See `start_link1/` for more information on individual options.
+  See `start_link/1` for more information on individual options.
   """
   @type option ::
-          {:dispatch_cooldown, pos_integer()}
+          {:cron, service()}
+          | {:dispatch_cooldown, pos_integer()}
           | {:engine, module()}
-          | {:get_dynamic_repo, nil | (-> pid() | atom()) | {module(), atom(), list()}}
-          | {:log, false | Logger.level()}
+          | {:insert_trigger, boolean()}
+          | {:lifeline, service()}
           | {:name, name()}
           | {:node, oban_node()}
           | {:notifier, module() | {module(), Keyword.t()}}
           | {:peer, false | module() | {module(), Keyword.t()}}
-          | {:plugins, false | [module() | {module() | Keyword.t()}]}
+          | {:plugins, false | [module() | {module(), Keyword.t()}]}
           | {:prefix, false | String.t()}
-          | {:queues, false | [{queue_name(), pos_integer() | Keyword.t()}]}
-          | {:repo, module()}
+          | {:pruner, service()}
+          | {:queues,
+             false | [{queue_name(), pos_integer() | Keyword.t()}] | {module(), Keyword.t()}}
+          | {:reindexer, service()}
+          | {:repo, module() | {module(), Keyword.t()}}
           | {:shutdown_grace_period, non_neg_integer()}
           | {:stage_interval, timeout()}
+          | {:stager, service()}
           | {:testing, :disabled | :inline | :manual}
 
   @typedoc """
@@ -135,16 +151,19 @@ defmodule Oban do
   """
   @type multi_name :: Multi.name()
 
+  defguardp is_stream(value)
+            when is_struct(value, Stream) or is_function(value, 2)
+
   defguardp is_changeset_or_fun(cf)
             when is_struct(cf, Changeset) or is_function(cf, 1)
 
-  defguardp is_list_or_wrapper(cw)
+  defguardp is_insertable(cw)
             when is_list(cw) or
-                   is_struct(cw, Stream) or
+                   is_stream(cw) or
                    is_function(cw, 1) or
                    (is_map_key(cw, :changesets) and is_list(cw.changesets)) or
-                   (is_map_key(cw, :changesets) and is_struct(cw.changesets, Stream)) or
-                   (is_map_key(cw, :changesets) and is_function(cw.changesets))
+                   (is_map_key(cw, :changesets) and is_stream(cw.changesets)) or
+                   (is_map_key(cw, :changesets) and is_function(cw.changesets, 1))
 
   @doc """
   Creates a facade for `Oban` functions and automates fetching configuration from the application
@@ -218,6 +237,10 @@ defmodule Oban do
         |> Keyword.merge(opts)
         |> Keyword.put(:name, __MODULE__)
         |> Oban.child_spec()
+      end
+
+      def all_jobs(queryable) do
+        Oban.all_jobs(__MODULE__, queryable)
       end
 
       def cancel_all_jobs(queryable) do
@@ -312,7 +335,8 @@ defmodule Oban do
         Oban.update_job(__MODULE__, job_or_id, changes_or_fun)
       end
 
-      defoverridable cancel_all_jobs: 1,
+      defoverridable all_jobs: 1,
+                     cancel_all_jobs: 1,
                      cancel_job: 1,
                      check_queue: 1,
                      check_all_queues: 0,
@@ -350,7 +374,20 @@ defmodule Oban do
 
   These options are required; without them the supervisor won't start:
 
-  * `:repo` — specifies the Ecto repo used to insert and retrieve jobs
+  * `:repo` — specifies the Ecto repo used to insert and retrieve jobs.
+
+    Repo-specific options may be provided as a `{repo, opts}` tuple:
+
+    * `:log` — either `false` to disable logging or a standard log level (`:error`, `:warning`,
+      `:info`, `:debug`, etc.). This determines whether queries are logged, overriding the repo's
+      configured log level. Defaults to `false`, where no queries are logged.
+
+    * `:dynamic_repo` — a zero-arity function or MFA tuple that returns the pid or name of the repo
+      to use for queries, for applications that run with a dynamically configured repo.
+
+    For example, to insert and retrieve jobs without logging queries:
+
+        repo: {MyApp.Repo, log: false}
 
   ### Primary Options
 
@@ -369,10 +406,6 @@ defmodule Oban do
     are also available as an add-on.
 
     Defaults to the `Basic` engine for Postgres.
-
-  * `:log` — either `false` to disable logging or a standard log level (`:error`, `:warning`,
-    `:info`, `:debug`, etc.). This determines whether queries are logged or not; overriding the
-    repo's configured log level. Defaults to `false`, where no queries are logged.
 
   * `:name` — used for supervisor registration, it must be unique across an entire VM instance.
     Defaults to `Oban` when no name is provided.
@@ -401,6 +434,10 @@ defmodule Oban do
     supervisor. Any supervisable module is a valid plugin, i.e. a `GenServer` or an `Agent`. May
     also be set to `false` to disable plugins _and_ disable leadership.
 
+    The most common plugins have dedicated top-level keys (see "Service Options" below). Prefer
+    those over a raw `:plugins` entry. Configuring the same plugin through both a service key and
+    `:plugins` raises during validation, while `false` disables plugins from both.
+
   * `:prefix` — the query prefix, or schema, to use for inserting and executing jobs. An
     `oban_jobs` table must exist within the prefix. See the "Prefix Support" section in the module
     documentation for more details.
@@ -415,21 +452,80 @@ defmodule Oban do
 
     Using an empty list or `false` prevents any queues from starting on init.
 
+    A `{module, options}` tuple hands queue management to an alternative implementation, such as an
+    Oban Pro plugin, which is started as a plugin and controls which queues run:
+
+        queues: {Oban.Pro.Queues, queues: [default: 10]}
+
+    A static keyword list is equivalent to the built-in `Oban.Queues`, which starts the listed
+    queues on init and leaves them running. Either form runs regardless of the `:plugins` setting,
+    which only applies to maintenance plugins.
+
   * `:testing` — a mode that controls how an instance is configured for testing. When set to
     `:inline` or `:manual` queues, peers, and plugins are automatically disabled. Defaults to
     `:disabled`, no test mode.
+
+  ### Service Options
+
+  These keys configure Oban's built-in maintenance modules. Each accepts a keyword list of
+  options, a module for an implementation, or `false` to disable it. See the linked module for the
+  available options.
+
+  * `:cron` — schedule recurring jobs with a crontab, see `Oban.Cron`
+  * `:lifeline` — rescue jobs orphaned when a node shuts down, see `Oban.Lifeline`
+  * `:pruner` — delete completed, cancelled, and discarded jobs, see `Oban.Pruner`
+  * `:reindexer` — periodically rebuild indexes to combat bloat, see `Oban.Reindexer`
+  * `:stager` — make scheduled or retryable jobs available and notify queues, see "Staging Jobs"
+    below
+
+  For example, to prune jobs after a day and run a nightly worker:
+
+      cron: [crontab: [{"0 2 * * *", MyApp.NightlyWorker}]],
+      pruner: [max_age: {1, :day}]
+
+  Each key also accepts a module to use a specific implementation with default options, or a
+  `{module, options}` tuple to pass it options. For example, to run the default reindexer, or an
+  Oban Pro Cron module instead:
+
+      reindexer: Oban.Reindexer,
+      cron: {Oban.Pro.Cron, [crontab: ...]}
+
+  Setting `plugins: false` disables plugins configured through service keys as well, without any
+  need to disable them individually. The `:queues` option accepts the same tuple form, but it isn't
+  a service key and always runs, see "Primary Options" above.
+
+  #### Staging Jobs
+
+  The stager periodically makes `scheduled` or `retryable` jobs available to run and notifies
+  relevant queues that they have jobs to run. Because staging is essential for job execution, the
+  stager always runs and isn't disabled by `plugins: false`. It accepts the following options:
+
+  * `:interval` — the number of milliseconds between staging jobs and notifying queues. This is
+    directly tied to the resolution of `scheduled` or `retryable` jobs and how frequently the
+    database is checked for jobs to run. Setting the interval to `:infinity` disables staging
+    entirely. The default is `1_000ms`.
+
+  * `:limit` — the maximum number of jobs staged at each interval, used to minimize database
+    load. The default is `5_000`.
+
+  Only the leader node stages jobs and notifies queues when the `:notifier`'s pubsub
+  notifications are functional. If pubsub messages can't get through then staging switches to a
+  less efficient "local" mode in which all nodes poll for jobs to run.
 
   ### Twiddly Options
 
   Additional options used to tune system behaviour. These are primarily useful for testing or
   troubleshooting and don't usually need modification.
 
-  * `:dispatch_cooldown` — the minimum number of milliseconds a producer will wait before fetching
-    and running more jobs. A slight cooldown period prevents a producer from flooding with
-    messages and thrashing the database. The cooldown period _directly impacts_ a producer's
-    throughput: jobs per second for a single queue is calculated by `(1000 / cooldown) * limit`.
-    For example, with a `5ms` cooldown and a queue limit of `25` a single queue can run 5,000
-    jobs/sec.
+  * `:dispatch_cooldown` — the average number of milliseconds a producer will wait before
+    fetching and running more jobs. A cooldown period prevents a producer from flooding with
+    messages and thrashing the database. Jitter is applied so that the actual wait varies between
+    roughly `0` and `2x` the configured value, which prevents producers from synchronizing their
+    fetches and stampeding the database.
+
+    The cooldown period _directly impacts_ a producer's throughput: average jobs per second for a
+    single queue is approximately `(1000 / cooldown) * limit`. For example, with a `5ms` cooldown
+    and a queue limit of `25` a single queue averages 5,000 jobs/sec.
 
     The default is `5ms` and the minimum is `1ms`, which is likely faster than the database can
     return new jobs to run.
@@ -439,24 +535,16 @@ defmodule Oban do
     may become a bottleneck.
 
     The trigger mechanism is designed to make jobs execute immediately after insert, rather than
-    up to `:stage_interval` (1 second) afterwards, and it can safely be disabled to improve insert
-    throughput.
+    up to the stager's `:interval` (1 second) afterwards, and it can safely be disabled to
+    improve insert throughput.
 
     Defaults to `true`, with triggering enabled.
 
   * `:shutdown_grace_period` — the amount of time a queue will wait for executing jobs to complete
     before hard shutdown, specified in milliseconds. The default is `15_000`, or 15 seconds.
 
-  * `:stage_interval` — the number of milliseconds between making scheduled jobs available and
-    notifying relevant queues that jobs are available. This is directly tied to the resolution of
-    `scheduled` or `retryable` jobs and how frequently the database is checked for jobs to run. To
-    minimize database load, only `5_000` jobs are staged at each interval.
-
-    Only the leader node stages jobs and notifies queues when the `:notifier's` pubsub
-    notifications are functional. If pubsub messages can't get through then staging switches to a
-    less efficient "local" mode in which all nodes poll for jobs to run.
-
-    Setting the interval to `:infinity` disables staging entirely. The default is `1_000ms`.
+  * `:stage_interval` — a deprecated alias for the stager's `:interval` option. Use
+    `stager: [interval: 1_000]` instead, see "Service Options" above.
 
   ## Example
 
@@ -508,7 +596,15 @@ defmodule Oban do
   def start_link(opts) when is_list(opts) do
     conf = Config.new(opts)
 
+    verify_migrated!(conf)
+
     Supervisor.start_link(__MODULE__, conf, name: Registry.via(conf.name, nil, conf))
+  end
+
+  defp verify_migrated!(conf) do
+    if conf.testing != :disabled do
+      Oban.Migration.verify_migrated!(repo: conf.repo, prefix: conf.prefix)
+    end
   end
 
   @doc false
@@ -689,7 +785,7 @@ defmodule Oban do
   end
 
   @doc false
-  def insert_all(changesets, opts) when is_list_or_wrapper(changesets) do
+  def insert_all(changesets, opts) when is_insertable(changesets) do
     insert_all(__MODULE__, changesets, opts)
   end
 
@@ -762,24 +858,23 @@ defmodule Oban do
         ) :: [Job.t()] | Multi.t()
   def insert_all(name \\ __MODULE__, changesets, opts \\ [])
 
-  def insert_all(name, changesets, opts) when is_list_or_wrapper(changesets) and is_list(opts) do
+  def insert_all(name, changesets, opts) when is_insertable(changesets) and is_list(opts) do
     name
     |> config()
     |> Engine.insert_all_jobs(changesets, opts)
   end
 
-  def insert_all(%Multi{} = multi, multi_name, changesets) when is_list_or_wrapper(changesets) do
+  def insert_all(%Multi{} = multi, multi_name, changesets) when is_insertable(changesets) do
     insert_all(__MODULE__, multi, multi_name, changesets, [])
   end
 
   @doc false
-  def insert_all(%Multi{} = multi, multi_name, changesets, opts)
-      when is_list_or_wrapper(changesets) do
+  def insert_all(%Multi{} = multi, multi_name, changesets, opts) when is_insertable(changesets) do
     insert_all(__MODULE__, multi, multi_name, changesets, opts)
   end
 
   @doc false
-  def insert_all(name, multi, multi_name, changesets) when is_list_or_wrapper(changesets) do
+  def insert_all(name, multi, multi_name, changesets) when is_insertable(changesets) do
     insert_all(name, multi, multi_name, changesets, [])
   end
 
@@ -813,7 +908,7 @@ defmodule Oban do
   @spec insert_all(name(), Multi.t(), multi_name(), changesets_or_wrapper_or_fun(), Keyword.t()) ::
           Multi.t()
   def insert_all(name, multi, multi_name, changesets, opts)
-      when is_list_or_wrapper(changesets) and is_list(opts) do
+      when is_insertable(changesets) and is_list(opts) do
     name
     |> config()
     |> Engine.insert_all_jobs(multi, multi_name, changesets, opts)
@@ -924,6 +1019,7 @@ defmodule Oban do
   * `:local_only` - whether the queue will be started only on the local node, default: `false`
   * `:limit` - set the concurrency limit, required
   * `:paused` — set whether the queue starts in the "paused" state, optional
+  * `:dispatch_cooldown` — set the average time between fetching jobs, optional
 
   In addition, all engine-specific queue options are passed along after validation.
 
@@ -954,14 +1050,18 @@ defmodule Oban do
   def start_queue(name \\ __MODULE__, [_ | _] = opts) do
     conf = config(name)
 
-    validate_queue_opts!(opts, ~w(local_only queue)a)
-    validate_engine_meta!(conf, opts)
+    validate_queue_opts!(opts, ~w(dispatch_cooldown local_only node queue)a)
+
+    opts
+    |> Keyword.delete(:dispatch_cooldown)
+    |> then(&validate_engine_meta!(conf, &1))
 
     data =
       opts
       |> Map.new()
       |> Map.put(:action, :start)
       |> Map.put(:ident, scope_signal(conf, opts))
+      |> Map.drop([:node])
 
     Notifier.notify(conf, :signal, data)
   end
@@ -1347,15 +1447,15 @@ defmodule Oban do
 
   Retries jobs with the `retryable` state:
 
-      Oban.Job
-      |> Ecto.Query.where(state: "retryable")
+      [state: :retryable]
+      |> Oban.Job.query()
       |> Oban.retry_all_jobs()
       {:ok, 3}
 
-  Retries all inactive jobs with priority 0
+  Retries all inactive jobs with priority 0:
 
-      Oban.Job
-      |> Ecto.Query.where(priority: 0)
+      [priority: 0]
+      |> Oban.Job.query()
       |> Oban.retry_all_jobs()
       {:ok, 5}
   """
@@ -1396,9 +1496,38 @@ defmodule Oban do
   def cancel_job(name, %Job{id: job_id}), do: cancel_job(name, job_id)
 
   def cancel_job(name, job_id) when is_integer(job_id) do
-    import Ecto.Query, only: [where: 2]
-
     with {:ok, _count} <- cancel_all_jobs(name, where(Job, id: ^job_id)), do: :ok
+  end
+
+  @doc """
+  Fetch all jobs matching a queryable.
+
+  The `queryable` is typically `Oban.Job` or an `Ecto.Query` built from it, for example via
+  `Oban.Job.query/1` or direct `Ecto.Query` composition. Jobs are loaded through the repo
+  configured for the given instance.
+
+  ## Examples
+
+  Fetch every job:
+
+      Oban.all_jobs(Oban.Job)
+
+  Fetch jobs matching a set of filters:
+
+      [state: ~w(available scheduled), worker: MyApp.Worker]
+      |> Oban.Job.query()
+      |> Oban.all_jobs()
+
+  Fetch jobs from a custom instance:
+
+      Oban.all_jobs(MyOban, Oban.Job)
+  """
+  @doc since: "2.22.0"
+  @spec all_jobs(name(), queryable :: Ecto.Queryable.t()) :: [Job.t()]
+  def all_jobs(name \\ __MODULE__, queryable) do
+    name
+    |> config()
+    |> Repo.all(queryable)
   end
 
   @doc """
@@ -1419,8 +1548,8 @@ defmodule Oban do
 
   Cancel all jobs for a specific worker:
 
-      Oban.Job
-      |> Ecto.Query.where(worker: "MyApp.MyWorker")
+      [worker: MyApp.MyWorker]
+      |> Oban.Job.query()
       |> Oban.cancel_all_jobs()
       {:ok, 2}
   """
@@ -1477,8 +1606,8 @@ defmodule Oban do
 
   Delete all jobs for a specific worker:
 
-      Oban.Job
-      |> Ecto.Query.where(worker: "MyApp.MyWorker")
+      [worker: MyApp.MyWorker]
+      |> Oban.Job.query()
       |> Oban.delete_all_jobs()
       {:ok, 9}
   """
@@ -1621,6 +1750,13 @@ defmodule Oban do
   defp validate_queue_opts!({:local_only, local_only}) do
     if not is_boolean(local_only) do
       raise ArgumentError, "expected :local_only to be a boolean, got: #{inspect(local_only)}"
+    end
+  end
+
+  defp validate_queue_opts!({:dispatch_cooldown, dispatch_cooldown}) do
+    if not (is_integer(dispatch_cooldown) and dispatch_cooldown > 0) do
+      raise ArgumentError,
+            "expected :dispatch_cooldown to be a positive integer, got: #{inspect(dispatch_cooldown)}"
     end
   end
 

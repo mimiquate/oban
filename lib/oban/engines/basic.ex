@@ -17,6 +17,9 @@ defmodule Oban.Engines.Basic do
   alias Ecto.Changeset
   alias Oban.{Config, Engine, Job, Repo}
 
+  @acking_states ["executing"]
+  @cancel_states ["executing", "cancelled"]
+
   # This is a replacement for `push`, which uses `array_append` and isn't compatible with jsonb
   # arrays. The `||` operator works with both arrays and jsonb.
   defmacrop concat_errors(column, error) do
@@ -33,7 +36,7 @@ defmodule Oban.Engines.Basic do
           opts
           |> Map.new()
           |> Map.put_new(:paused, false)
-          |> Map.put_new(:refresh_interval, :timer.seconds(30))
+          |> Map.put_new(:refresh_interval, :timer.seconds(60))
           |> Map.put_new(:uuid, Ecto.UUID.generate())
           |> Map.merge(%{name: conf.name, node: conf.node})
           |> Map.merge(%{started_at: utc_now(), updated_at: utc_now(), shutdown_started_at: nil})
@@ -69,9 +72,19 @@ defmodule Oban.Engines.Basic do
 
   @impl Engine
   def insert_job(%Config{} = conf, %Changeset{} = changeset, opts) do
-    fun = fn -> insert_unique(conf, changeset, opts) end
+    inst_opts = Keyword.take(opts, [:on_conflict, :timeout])
 
-    with {:ok, result} <- Repo.transaction(conf, fun), do: result
+    case unique_query(changeset) do
+      {:ok, query, lock_key} ->
+        repo_opts = Keyword.drop(opts, [:on_conflict, :timeout])
+
+        fun = fn -> insert_unique(conf, changeset, query, lock_key, inst_opts) end
+
+        with {:ok, result} <- Repo.transaction(conf, fun, repo_opts), do: result
+
+      nil ->
+        Repo.insert(conf, changeset, inst_opts)
+    end
   end
 
   @impl Engine
@@ -214,11 +227,9 @@ defmodule Oban.Engines.Basic do
 
   @impl Engine
   def complete_job(%Config{} = conf, %Job{} = job) do
-    Repo.update_all(
-      conf,
-      where(Job, id: ^job.id),
-      set: [state: "completed", completed_at: utc_now()]
-    )
+    query = ack_query(job, @acking_states)
+
+    Repo.update_all(conf, query, set: [state: "completed", completed_at: utc_now()])
 
     :ok
   end
@@ -226,8 +237,8 @@ defmodule Oban.Engines.Basic do
   @impl Engine
   def discard_job(%Config{} = conf, %Job{} = job) do
     query =
-      Job
-      |> where(id: ^job.id)
+      job
+      |> ack_query(@acking_states)
       |> update([j],
         set: [
           state: "discarded",
@@ -244,8 +255,8 @@ defmodule Oban.Engines.Basic do
   @impl Engine
   def error_job(%Config{} = conf, %Job{} = job, seconds) when is_integer(seconds) do
     query =
-      Job
-      |> where(id: ^job.id)
+      job
+      |> ack_query(@acking_states)
       |> update([j],
         set: [
           state: "retryable",
@@ -260,35 +271,53 @@ defmodule Oban.Engines.Basic do
   end
 
   @impl Engine
-  def snooze_job(%Config{} = conf, %Job{id: id}, seconds) when is_integer(seconds) do
-    updates = [
-      set: [state: "scheduled", scheduled_at: seconds_from_now(seconds)],
-      inc: [max_attempts: 1]
-    ]
+  def snooze_job(%Config{} = conf, %Job{} = job, seconds) when is_integer(seconds) do
+    query =
+      job
+      |> ack_query(@acking_states)
+      |> update([j],
+        set: [
+          state: "scheduled",
+          scheduled_at: ^seconds_from_now(seconds),
+          meta:
+            fragment(
+              "jsonb_set(?, '{snoozed}', to_jsonb(coalesce((?->>'snoozed')::int, 0) + 1))",
+              j.meta,
+              j.meta
+            )
+        ],
+        inc: [attempt: -1]
+      )
 
-    Repo.update_all(conf, where(Job, id: ^id), updates)
+    Repo.update_all(conf, query, [])
 
     :ok
   end
 
   @impl Engine
-  def cancel_job(%Config{} = conf, %Job{} = job) do
-    query = where(Job, id: ^job.id)
-
+  def cancel_job(%Config{} = conf, %Job{unsaved_error: unsaved} = job) when is_map(unsaved) do
     query =
-      if is_map(job.unsaved_error) do
-        update(query, [j],
-          set: [
-            state: "cancelled",
-            cancelled_at: ^utc_now(),
-            errors: concat_errors(j.errors, ^[Job.format_attempt(job)])
-          ]
-        )
-      else
-        query
-        |> where([j], j.state not in ["cancelled", "completed", "discarded"])
-        |> update(set: [state: "cancelled", cancelled_at: ^utc_now()])
-      end
+      job
+      |> ack_query(@cancel_states)
+      |> update([j],
+        set: [
+          state: "cancelled",
+          cancelled_at: ^utc_now(),
+          errors: concat_errors(j.errors, ^[Job.format_attempt(job)])
+        ]
+      )
+
+    Repo.update_all(conf, query, [])
+
+    :ok
+  end
+
+  def cancel_job(%Config{} = conf, %Job{} = job) do
+    query =
+      Job
+      |> where(id: ^job.id)
+      |> where([j], j.state not in ["cancelled", "completed", "discarded"])
+      |> update(set: [state: "cancelled", cancelled_at: ^utc_now()])
 
     Repo.update_all(conf, query, [])
 
@@ -425,11 +454,10 @@ defmodule Oban.Engines.Basic do
 
   # Insertion
 
-  defp insert_unique(conf, changeset, opts) do
+  defp insert_unique(conf, changeset, query, lock_key, opts) do
     opts = Keyword.put(opts, :on_conflict, :nothing)
 
-    with {:ok, query, lock_key} <- unique_query(changeset),
-         :ok <- acquire_lock(conf, lock_key),
+    with :ok <- acquire_lock(conf, lock_key),
          {:ok, job} <- fetch_job(conf, query, opts),
          {:ok, job} <- resolve_conflict(conf, job, changeset, opts) do
       {:ok, %{job | conflict?: true}}
@@ -547,6 +575,13 @@ defmodule Oban.Engines.Basic do
       nil -> nil
       job -> {:ok, job}
     end
+  end
+
+  defp ack_query(%Job{} = job, states) do
+    Job
+    |> where([j], j.id == ^job.id)
+    |> where([j], j.state in ^states)
+    |> where([j], j.attempted_at == ^job.attempted_at)
   end
 
   defp seconds_from_now(seconds), do: DateTime.add(utc_now(), seconds, :second)

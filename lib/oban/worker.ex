@@ -100,8 +100,9 @@ defmodule Oban.Worker do
     already, the job is marked as `retryable` and scheduled to run again. Otherwise, the job is
     marked as `discarded` and won't be retried.
 
-  * `{:snooze, seconds}` — mark the job as `snoozed` and schedule it to run again `seconds` in the
-    future. See [Snoozing](#module-snoozing-jobs) for more details.
+  * `{:snooze, period}` — mark the job as `snoozed` and schedule it to run again after the specified
+    period. The period can be a number of seconds or a tuple like `{5, :minutes}`.
+    See [Snoozing](#module-snoozing-jobs) for more details.
 
   In addition to explicit return values, any _unhandled exception_, _exit_ or _throw_ will fail
   the job and schedule a retry under the same conditions as in the `{:error, error}` case.
@@ -260,40 +261,45 @@ defmodule Oban.Worker do
 
   ## Snoozing Jobs
 
-  When returning `{:snooze, snooze_time}` in `c:perform/1`, the job is postponed for at least
-  `snooze_time` seconds. Snoozing is done by incrementing the job's `max_attempts` field and
-  scheduling execution for `snooze_time` seconds in the future.
+  When returning `{:snooze, period}` in `c:perform/1`, the job is postponed for at least
+  the specified period. The period can be specified as:
 
-  Executing bumps a job's `attempt` count. Despite snooze incrementing the `max_attempts` to
-  preserve total retries, the change to `attempt` will affect the default backoff retry
-  algorithm.
+  * An integer representing seconds: `{:snooze, 60}` - snooze for 60 seconds
+  * A tuple with a value and time unit: `{:snooze, {5, :minutes}}` - snooze for 5 minutes
 
-  > #### 🌟 Snoozes and Attempts {: .info}
-  >
-  > Oban Pro's [Smart Engine](https://oban.pro/docs/pro/Oban.Pro.Engines.Smart.html) rolls back
-  > the `attempt` and preserves the original `max_attempts` in order to differentiate between
-  > "real" attempts and snoozes, which keeps backoff calculation accurate.
-  >
-  > Without attempt correction you may need a solution that compensates for snoozing, such as the
-  > example below:
+  Supported time units are: `:second`, `:seconds`, `:minute`, `:minutes`, `:hour`, `:hours`,
+  `:day`, `:days`, `:week`, `:weeks`.
 
-      defmodule MyApp.SnoozingWorker do
-        @max_attempts 20
+  Snoozing schedules execution for the specified period in the future and rolls back the job's
+  `attempt`. The original `max_attempts` is preserved, so a snooze never consumes an attempt and
+  backoff calculation stays accurate no matter how many times a job snoozes.
 
-        use Oban.Worker, max_attempts: @max_attempts
+  Each snooze also increments a `snoozed` count in the job's `meta`, which makes it possible to
+  differentiate between "real" attempts and snoozes.
 
-        @impl Worker
-        def backoff(%Job{} = job) do
-          corrected_attempt = @max_attempts - (job.max_attempts - job.attempt)
+  ### Examples
 
-          Worker.backoff(%{job | attempt: corrected_attempt})
-        end
+  ```elixir
+    # Snooze for 60 seconds
+    def perform(job) do
+      if ready?(job), do: :ok, else: {:snooze, 60}
+    end
 
-        @impl Worker
-        def perform(job) do
-          if MyApp.something?(job), do: :ok, else: {:snooze, 60}
-        end
-      end
+    # Snooze for 5 minutes
+    def perform(job) do
+      if ready?(job), do: :ok, else: {:snooze, {5, :minutes}}
+    end
+
+    # Snooze for 1 hour
+    def perform(job) do
+      if rate_limited?(job), do: {:snooze, {1, :hour}}, else: :ok
+    end
+
+    # Give up after snoozing too many times
+    def perform(%Job{meta: %{"snoozed" => snoozed}}) when snoozed > 5 do
+      {:cancel, :snoozed_too_many_times}
+    end
+    ```
 
   ## Workers in A Different Application
 
@@ -331,7 +337,7 @@ defmodule Oban.Worker do
 
   import Kernel, except: [to_string: 1]
 
-  alias Oban.{Backoff, Job, Validation}
+  alias Oban.{Backoff, Job, Period, Validation}
 
   @type t :: module()
 
@@ -343,7 +349,8 @@ defmodule Oban.Worker do
   - `{:cancel, reason}` - the job is marked as `cancelled` for the provided reason and no longer retried.
   - `{:error, reason}` - the job is marked as `retryable` for the provided reason, or `discarded`
     if it has  exhausted all attempts.
-  - `{:snooze, seconds}` - mark the job as `scheduled` to run again `seconds` in the future.
+  - `{:snooze, period}` - mark the job as `scheduled` to run again after the specified period.
+    The period can be an integer (seconds) or a tuple like `{5, :minutes}`.
 
   > #### Deprecated {: .warning}
   >
@@ -357,7 +364,7 @@ defmodule Oban.Worker do
           | {:discard, reason :: term()}
           | {:ok, ignored :: term()}
           | {:error, reason :: term()}
-          | {:snooze, seconds :: non_neg_integer()}
+          | {:snooze, period :: Period.t()}
 
   @doc """
   Build a job changeset for this worker with optional overrides.
@@ -404,6 +411,36 @@ defmodule Oban.Worker do
   """
   @callback perform(job :: Job.t()) :: result()
 
+  @doc """
+  Returns the worker's compile-time options.
+
+  These options are defined when using `use Oban.Worker` and include:
+
+  * `:max_attempts` — Maximum retry attempts
+  * `:priority` — Job priority (0-9)
+  * `:queue` — Queue name
+  * `:tags` — Job tags
+  * `:replace` — Replacement rules
+  * `:unique` — Uniqueness constraints
+  * `:worker` — The worker module name as a string (automatically added)
+
+  The options returned by this callback are used as defaults when building job changesets with
+  `c:new/2`. They can be overridden at runtime by passing options to `new/2`.
+
+  ## Example
+
+      defmodule MyApp.Worker do
+        use Oban.Worker, queue: :events, max_attempts: 5
+
+        @impl Oban.Worker
+        def perform(_job), do: :ok
+      end
+
+      MyApp.Worker.__opts__()
+      #=> [queue: :events, max_attempts: 5, worker: "MyApp.Worker"]
+  """
+  @callback __opts__() :: Keyword.t()
+
   @clamped_max 20
 
   @doc false
@@ -414,9 +451,9 @@ defmodule Oban.Worker do
       @after_compile Worker
       @behaviour Worker
 
-      @doc false
+      @impl Worker
       def __opts__ do
-        Keyword.put(unquote(opts), :worker, to_string(__MODULE__))
+        Keyword.put(unquote(opts), :worker, inspect(__MODULE__))
       end
 
       @impl Worker
@@ -439,8 +476,10 @@ defmodule Oban.Worker do
   end
 
   @doc false
-  defmacro __after_compile__(%{module: module}, _env) do
-    Validation.validate_schema!(module.__opts__(),
+  defmacro __after_compile__(%{module: module} = env, _bytecode) do
+    opts = module.__opts__()
+
+    Validation.validate_schema!(opts,
       max_attempts: :pos_integer,
       priority: {:range, 0..9},
       queue: {:or, [:atom, :string]},
@@ -449,6 +488,10 @@ defmodule Oban.Worker do
       unique: {:custom, &Job.validate_unique/1},
       worker: :string
     )
+
+    with {:warn, message} <- Job.warn_unique(opts[:unique]) do
+      IO.warn(message, Macro.Env.stacktrace(env))
+    end
   end
 
   @doc false

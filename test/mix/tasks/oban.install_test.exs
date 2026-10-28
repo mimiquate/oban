@@ -50,6 +50,8 @@ defmodule Mix.Tasks.Oban.InstallTest do
         |   engine: Oban.Engines.Basic,
         |   notifier: Oban.Notifiers.Postgres,
         |   queues: [default: 10],
+        |   lifeline: [rescue_after: {2, :hours}],
+        |   pruner: [max_age: {1, :day}],
         |   repo: Oban.Test.Repo
       """)
       |> assert_has_patch("config/test.exs", """
@@ -96,6 +98,8 @@ defmodule Mix.Tasks.Oban.InstallTest do
         |   engine: Oban.Engines.Basic,
         |   notifier: Oban.Notifiers.Postgres,
         |   queues: [default: 10],
+        |   lifeline: [rescue_after: {2, :hours}],
+        |   pruner: [max_age: {1, :day}],
         |   repo: Oban.Test.Repo
       """)
       |> assert_has_patch("config/test.exs", """
@@ -146,7 +150,74 @@ defmodule Mix.Tasks.Oban.InstallTest do
         |   engine: Oban.Engines.Lite,
         |   notifier: Oban.Notifiers.PG,
         |   queues: [default: 10],
+        |   lifeline: [rescue_after: {2, :hours}],
+        |   pruner: [max_age: {1, :day}],
         |   repo: Oban.Test.LiteRepo
+      """)
+    end
+
+    test "installing with an unsupported adapter repos shows an error" do
+      repo = """
+      defmodule Oban.Test.TdsRepo do
+        @moduledoc false
+
+        use Ecto.Repo, otp_app: :oban, adapter: Ecto.Adapters.Tds
+      end
+      """
+
+      assert {:error, [warning]} =
+               [app_name: :oban, files: %{"lib/oban/repo.ex" => repo}]
+               |> test_project()
+               |> Igniter.compose_task("oban.install", [])
+               |> apply_igniter()
+
+      assert warning =~ "No compatible Ecto repo found"
+    end
+
+    test "installing skips unsupported adapter and uses supported repo" do
+      application = """
+      defmodule Oban.Application do
+        use Application
+
+        def start(_type, _args) do
+          children = [Oban.Test.TdsRepo, Oban.Test.Repo, MyWeb.Endpoint]
+        end
+      end
+      """
+
+      tds_repo = """
+      defmodule Oban.Test.TdsRepo do
+        @moduledoc false
+
+        use Ecto.Repo, otp_app: :oban, adapter: Ecto.Adapters.Tds
+      end
+      """
+
+      postgres_repo = """
+      defmodule Oban.Test.Repo do
+        @moduledoc false
+
+        use Ecto.Repo, otp_app: :oban, adapter: Ecto.Adapters.Postgres
+      end
+      """
+
+      files = %{
+        "lib/oban/application.ex" => application,
+        "lib/oban/tds_repo.ex" => tds_repo,
+        "lib/oban/repo.ex" => postgres_repo
+      }
+
+      [app_name: :oban, files: files]
+      |> test_project()
+      |> Igniter.compose_task("oban.install", [])
+      |> assert_has_patch("config/config.exs", """
+        | config :oban, Oban,
+        |   engine: Oban.Engines.Basic,
+        |   notifier: Oban.Notifiers.Postgres,
+        |   queues: [default: 10],
+        |   lifeline: [rescue_after: {2, :hours}],
+        |   pruner: [max_age: {1, :day}],
+        |   repo: Oban.Test.Repo
       """)
     end
   end

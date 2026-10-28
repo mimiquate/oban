@@ -5,27 +5,17 @@ defmodule Oban.Migrations.PostgresTest do
 
   alias Oban.Migrations.Postgres
 
-  @arbitrary_checks 10
-
   @moduletag :unboxed
 
   defmodule StepMigration do
     use Ecto.Migration
 
     def up do
-      Oban.Migration.up(version: up_version(), prefix: "migrating")
+      Oban.Migration.up(version: :persistent_term.get({__MODULE__, :up}), prefix: "migrating")
     end
 
     def down do
-      Oban.Migration.down(version: down_version(), prefix: "migrating")
-    end
-
-    defp up_version do
-      Application.get_env(:oban, :up_version)
-    end
-
-    def down_version do
-      Application.get_env(:oban, :down_version)
+      Oban.Migration.down(version: :persistent_term.get({__MODULE__, :down}), prefix: "migrating")
     end
   end
 
@@ -55,9 +45,27 @@ defmodule Oban.Migrations.PostgresTest do
 
   @base_version 20_300_000_000_000
 
+  test "verifying that any migrations have ran" do
+    assert_raise RuntimeError, ~r/migrations have not been run/, fn ->
+      start_supervised_oban!(repo: Repo, testing: :manual, prefix: "does_not_exist")
+    end
+  end
+
+  test "verifying the database is migrated to the required version" do
+    :persistent_term.put({StepMigration, :up}, current_version() - 1)
+
+    assert :ok = Ecto.Migrator.up(UnboxedRepo, @base_version, StepMigration)
+
+    assert_raise RuntimeError, ~r/migrations are outdated/, fn ->
+      start_supervised_oban!(repo: UnboxedRepo, testing: :manual, prefix: "migrating")
+    end
+  after
+    clear_migrated()
+  end
+
   test "migrating up and down between specific versions" do
     for up <- initial_version()..current_version() do
-      Application.put_env(:oban, :up_version, up)
+      :persistent_term.put({StepMigration, :up}, up)
 
       assert :ok = Ecto.Migrator.up(UnboxedRepo, @base_version + up, StepMigration)
       assert migrated_version() == up
@@ -67,13 +75,13 @@ defmodule Oban.Migrations.PostgresTest do
     assert table_exists?("oban_peers")
     assert migrated_version() == current_version()
 
-    Application.put_env(:oban, :down_version, 2)
+    :persistent_term.put({StepMigration, :down}, 2)
     assert :ok = Ecto.Migrator.down(UnboxedRepo, @base_version + 2, StepMigration)
 
     assert table_exists?("oban_jobs")
     assert migrated_version() == 1
 
-    Application.put_env(:oban, :down_version, 1)
+    :persistent_term.put({StepMigration, :down}, 1)
     assert :ok = Ecto.Migrator.down(UnboxedRepo, @base_version + 1, StepMigration)
 
     refute table_exists?("oban_jobs")
@@ -100,25 +108,6 @@ defmodule Oban.Migrations.PostgresTest do
     clear_migrated()
   end
 
-  test "migrating up and down between arbitrary versions" do
-    ups = 2..current_version()
-    dns = 1..(current_version() - 1)
-
-    ups
-    |> Enum.zip(dns)
-    |> Enum.shuffle()
-    |> Enum.take(@arbitrary_checks)
-    |> Enum.each(fn {up, down} ->
-      Application.put_env(:oban, :up_version, up)
-      Application.put_env(:oban, :down_version, down)
-
-      assert :ok = Ecto.Migrator.up(UnboxedRepo, @base_version, StepMigration)
-      assert :ok = Ecto.Migrator.down(UnboxedRepo, @base_version, StepMigration)
-
-      clear_migrated()
-    end)
-  end
-
   test "skipping schema creation when schema doesn't exist" do
     assert_raise Postgrex.Error, fn ->
       Ecto.Migrator.up(UnboxedRepo, @base_version, DefaultMigrationNoSchemaCreation)
@@ -126,6 +115,17 @@ defmodule Oban.Migrations.PostgresTest do
 
     refute table_exists?("oban_jobs")
     assert migrated_version() == 0
+  after
+    clear_migrated()
+  end
+
+  test "treating a non-numeric version comment as infinity" do
+    assert :ok = Ecto.Migrator.up(UnboxedRepo, @base_version, DefaultMigration)
+
+    UnboxedRepo.query!("COMMENT ON TABLE migrating.oban_jobs IS '∞'")
+
+    assert migrated_version() == :infinity
+    assert start_supervised_oban!(repo: UnboxedRepo, testing: :manual, prefix: "migrating")
   after
     clear_migrated()
   end

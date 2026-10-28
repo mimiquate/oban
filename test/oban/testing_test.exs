@@ -154,6 +154,8 @@ defmodule Oban.TestingTest do
 
     test "returning the value of worker's perform/1 function" do
       assert :ok = perform_job(Worker, %{ref: 1, action: "OK"})
+      assert {:snooze, _} = perform_job(Worker, %{ref: 1, action: "SNOOZE"})
+      assert {:snooze, _} = perform_job(Worker, %{ref: 1, action: "SNOOZE_MINUTES"})
       assert {:cancel, _} = perform_job(Worker, %{ref: 1, action: "CANCEL"})
       assert :discard = perform_job(Worker, %{ref: 1, action: "DISCARD"})
       assert {:error, _} = perform_job(Worker, %{ref: 1, action: "ERROR"})
@@ -178,7 +180,7 @@ defmodule Oban.TestingTest do
 
       perform_job(MisbehavedWorker, %{"action" => "bad_timing", "timeout" => 20})
 
-      refute_receive {:EXIT, _pid, %Oban.TimeoutError{}}
+      refute_receive {:EXIT, _pid, %Oban.TimeoutError{}}, 25
     end
 
     test "injecting a complete conf into the job before execution" do
@@ -261,6 +263,19 @@ defmodule Oban.TestingTest do
       assert [%Job{}] = all_enqueued(worker: Pong, queue: :gamma)
       assert [%Job{}, %Job{}, %Job{}] = all_enqueued()
     end
+
+    test "retrieving jobs only in an incomplete state" do
+      insert!(%{id: 1}, state: "suspended")
+      insert!(%{id: 2}, state: "scheduled")
+      insert!(%{id: 3}, state: "available")
+      insert!(%{id: 4}, state: "executing")
+      insert!(%{id: 5}, state: "completed")
+
+      assert [1, 2, 3] ==
+               all_enqueued()
+               |> Enum.map(& &1.args["id"])
+               |> Enum.sort()
+    end
   end
 
   describe "assert_enqueued/1" do
@@ -293,6 +308,17 @@ defmodule Oban.TestingTest do
       assert_enqueued worker: Pong, scheduled_at: seconds_from_now(60)
       assert_enqueued worker: Pong, scheduled_at: {seconds_from_now(69), delta: 10}
       assert_enqueued worker: Pong, scheduled_at: ~U[2000-10-20 05:10:30.557748Z]
+    end
+
+    test "checking for jobs with a relative scheduled_in time" do
+      insert!(%{}, worker: Pong, scheduled_at: seconds_from_now(3600))
+
+      assert_enqueued worker: Pong, scheduled_in: 3600
+      assert_enqueued worker: Pong, scheduled_in: {1, :hour}
+      assert_enqueued worker: Pong, scheduled_in: {3609, delta: 10}
+      assert_enqueued worker: Pong, scheduled_in: {1, :hour, delta: 10}
+
+      refute_enqueued worker: Pong, scheduled_in: 60
     end
 
     test "asserting that jobs are now or will eventually be enqueued" do
@@ -422,7 +448,7 @@ defmodule Oban.TestingTest do
 
         assert_enqueued worker: Worker
 
-        refute_received {:ok, 1}, 25
+        refute_received {:ok, 1}
       end)
     end
 

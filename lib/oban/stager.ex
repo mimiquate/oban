@@ -3,12 +3,12 @@ defmodule Oban.Stager do
 
   use GenServer
 
-  alias Oban.{Engine, Job, Notifier, Peer, Plugin, Registry, Repo}
+  alias Oban.{Engine, Job, Notifier, Peer, Plugin, Registry, Repo, Validation}
   alias __MODULE__, as: State
 
   require Logger
 
-  @type option :: Plugin.option() | {:interval, pos_integer()}
+  @type option :: Plugin.option() | {:interval, timeout()} | {:limit, pos_integer()}
 
   defstruct [
     :conf,
@@ -22,15 +22,23 @@ defmodule Oban.Stager do
   def start_link(opts) do
     {name, opts} = Keyword.pop(opts, :name)
 
-    conf = Keyword.fetch!(opts, :conf)
+    state = struct!(State, opts)
 
-    if conf.stage_interval == :infinity do
+    if state.interval == :infinity do
       :ignore
     else
-      state = %State{conf: conf, interval: conf.stage_interval}
-
       GenServer.start_link(__MODULE__, state, name: name)
     end
+  end
+
+  @spec validate([option()]) :: :ok | {:error, String.t()}
+  def validate(opts) do
+    Validation.validate_schema(opts,
+      conf: :any,
+      name: :any,
+      interval: :timeout,
+      limit: :pos_integer
+    )
   end
 
   @impl GenServer
@@ -61,7 +69,7 @@ defmodule Oban.Stager do
           {:ok, Map.merge(meta, %{staged_count: length(staged), staged_jobs: staged})}
 
         {:error, error} ->
-          {:error, Map.put(meta, :error, error)}
+          {:error, Map.merge(meta, %{error: error, staged_count: 0, staged_jobs: []})}
       end
     end)
 
@@ -82,15 +90,25 @@ defmodule Oban.Stager do
   end
 
   defp stage_and_notify(true = _leader, state) do
-    Repo.transaction(state.conf, fn ->
+    fun = fn ->
       {:ok, staged} = Engine.stage_jobs(state.conf, Job, limit: state.limit)
 
       notify_queues(state)
 
       staged
-    end)
-  rescue
-    error in [DBConnection.ConnectionError, Postgrex.Error] -> {:error, error}
+    end
+
+    case Repo.transaction(state.conf, fun, on_exhausted: :log) do
+      {:ok, _staged} = result ->
+        result
+
+      {:error, _reason} = result ->
+        # Force notifying in local mode after an unrecovered database exception. This ensures jobs
+        # keep processing when staging or database driven notifications fail.
+        safe_notify(state)
+
+        result
+    end
   end
 
   defp stage_and_notify(_leader, state) do
@@ -99,12 +117,21 @@ defmodule Oban.Stager do
     {:ok, []}
   end
 
-  defp notify_queues(%{conf: conf, mode: :global}) do
+  defp safe_notify(state) do
+    notify_queues(state)
+  rescue
+    _ -> notify_queues(%{state | mode: :local})
+  end
+
+  defp notify_queues(%{conf: conf, mode: :global} = state) do
     {:ok, queues} = Engine.check_available(conf)
 
     payload = Enum.map(queues, &%{queue: &1})
 
-    Notifier.notify(conf, :insert, payload)
+    case Notifier.notify(conf, :insert, payload) do
+      :ok -> :ok
+      {:error, _reason} -> notify_queues(%{state | mode: :local})
+    end
   end
 
   defp notify_queues(%{conf: conf, mode: :local}) do

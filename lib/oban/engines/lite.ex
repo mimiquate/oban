@@ -22,6 +22,9 @@ defmodule Oban.Engines.Lite do
   alias Oban.Engines.Basic
   alias Oban.{Config, Engine, Job, JSON, Repo}
 
+  @acking_states ["executing"]
+  @cancel_states ["executing", "cancelled"]
+
   @forever 60 * 60 * 24 * 365 * 99
 
   # EctoSQLite3 doesn't implement `push` for updates, so a json_insert is required.
@@ -35,10 +38,15 @@ defmodule Oban.Engines.Lite do
     quote do
       fragment(
         """
-        SELECT 0 NOT IN (SELECT json_extract(?, '$.' || t.key) = t.value FROM json_each(?) t)
+        NOT EXISTS (
+          SELECT 1 FROM json_each(?) t
+          WHERE json_type(?, '$."' || t.key || '"') IS NOT t.type
+             OR json_extract(?, '$."' || t.key || '"') IS NOT t.value
+        )
         """,
+        unquote(object),
         unquote(column),
-        unquote(object)
+        unquote(column)
       )
     end
   end
@@ -146,7 +154,7 @@ defmodule Oban.Engines.Lite do
     select_query =
       queryable
       |> select([j], map(j, [:id, :queue, :state]))
-      |> where([j], j.state == "completed" and j.scheduled_at < ^time)
+      |> where([j], j.state == "completed" and j.completed_at < ^time)
       |> or_where([j], j.state == "cancelled" and j.cancelled_at < ^time)
       |> or_where([j], j.state == "discarded" and j.discarded_at < ^time)
       |> limit(^limit)
@@ -164,13 +172,34 @@ defmodule Oban.Engines.Lite do
   defdelegate complete_job(conf, job), to: Basic
 
   @impl Engine
-  defdelegate snooze_job(conf, job, seconds), to: Basic
+  def snooze_job(%Config{} = conf, job, seconds) do
+    query =
+      job
+      |> ack_query(@acking_states)
+      |> update([j],
+        set: [
+          state: "scheduled",
+          scheduled_at: ^seconds_from_now(seconds),
+          meta:
+            fragment(
+              "json_set(?, '$.snoozed', coalesce(json_extract(?, '$.snoozed'), 0) + 1)",
+              j.meta,
+              j.meta
+            )
+        ],
+        inc: [attempt: -1]
+      )
+
+    Repo.update_all(conf, query, [])
+
+    :ok
+  end
 
   @impl Engine
   def discard_job(%Config{} = conf, job) do
     query =
-      Job
-      |> where(id: ^job.id)
+      job
+      |> ack_query(@acking_states)
       |> update([j],
         set: [
           state: "discarded",
@@ -187,8 +216,8 @@ defmodule Oban.Engines.Lite do
   @impl Engine
   def error_job(%Config{} = conf, job, seconds) do
     query =
-      Job
-      |> where(id: ^job.id)
+      job
+      |> ack_query(@acking_states)
       |> update([j],
         set: [
           state: "retryable",
@@ -203,23 +232,29 @@ defmodule Oban.Engines.Lite do
   end
 
   @impl Engine
-  def cancel_job(%Config{} = conf, job) do
-    query = where(Job, id: ^job.id)
-
+  def cancel_job(%Config{} = conf, %Job{unsaved_error: unsaved} = job) when is_map(unsaved) do
     query =
-      if is_map(job.unsaved_error) do
-        update(query, [j],
-          set: [
-            state: "cancelled",
-            cancelled_at: ^utc_now(),
-            errors: json_push(j.errors, ^encode_unsaved(job))
-          ]
-        )
-      else
-        query
-        |> where([j], j.state not in ["cancelled", "completed", "discarded"])
-        |> update(set: [state: "cancelled", cancelled_at: ^utc_now()])
-      end
+      job
+      |> ack_query(@cancel_states)
+      |> update([j],
+        set: [
+          state: "cancelled",
+          cancelled_at: ^utc_now(),
+          errors: json_push(j.errors, ^encode_unsaved(job))
+        ]
+      )
+
+    Repo.update_all(conf, query, [])
+
+    :ok
+  end
+
+  def cancel_job(%Config{} = conf, job) do
+    query =
+      Job
+      |> where(id: ^job.id)
+      |> where([j], j.state not in ["cancelled", "completed", "discarded"])
+      |> update(set: [state: "cancelled", cancelled_at: ^utc_now()])
 
     Repo.update_all(conf, query, [])
 
@@ -390,6 +425,13 @@ defmodule Oban.Engines.Lite do
       :error ->
         {:ok, job}
     end
+  end
+
+  defp ack_query(%Job{} = job, states) do
+    Job
+    |> where([j], j.id == ^job.id)
+    |> where([j], j.state in ^states)
+    |> where([j], j.attempted_at == ^job.attempted_at)
   end
 
   defp seconds_from_now(seconds), do: DateTime.add(utc_now(), seconds, :second)

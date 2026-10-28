@@ -1,7 +1,7 @@
-defmodule Oban.Plugins.ReindexerTest do
+defmodule Oban.ReindexerTest do
   use Oban.Case, async: true
 
-  alias Oban.Plugins.Reindexer
+  alias Oban.Reindexer
   alias Oban.{Registry, TelemetryHandler}
 
   describe "validate/1" do
@@ -30,11 +30,15 @@ defmodule Oban.Plugins.ReindexerTest do
       assert :ok = Reindexer.validate(timezone: "America/Chicago")
     end
 
-    test "validating that :timeout is a non negative integer" do
+    test "validating that :timeout is a non negative integer, :infinity, or a period tuple" do
       assert {:error, _} = Reindexer.validate(timeout: "")
       assert {:error, _} = Reindexer.validate(timeout: -1)
+      assert {:error, _} = Reindexer.validate(timeout: {0, :seconds})
+      assert {:error, _} = Reindexer.validate(timeout: {1, :eon})
 
       assert :ok = Reindexer.validate(timeout: :timer.minutes(1))
+      assert :ok = Reindexer.validate(timeout: :infinity)
+      assert :ok = Reindexer.validate(timeout: {15, :seconds})
     end
 
     test "providing suggestions for unknown options" do
@@ -44,8 +48,6 @@ defmodule Oban.Plugins.ReindexerTest do
   end
 
   describe "integration" do
-    @describetag :reindex
-
     setup do
       TelemetryHandler.attach_events()
     end
@@ -63,7 +65,7 @@ defmodule Oban.Plugins.ReindexerTest do
     end
 
     test "reindexing according to the provided schedule" do
-      name = start_supervised_oban!(plugins: [{Reindexer, schedule: "* * * * *"}])
+      name = start_supervised_oban!(plugins: [Reindexer])
 
       name
       |> Registry.whereis({:plugin, Reindexer})
@@ -71,6 +73,50 @@ defmodule Oban.Plugins.ReindexerTest do
 
       assert_receive {:event, :start, _, %{plugin: Reindexer}}, 500
       assert_receive {:event, :stop, _, %{plugin: Reindexer}}, 500
+
+      stop_supervised(name)
+    end
+
+    @tag :unboxed
+    test "dropping all invalid indexes" do
+      index_name = "oban_jobs_test_invalid_idx"
+
+      on_exit(fn ->
+        UnboxedRepo.query("DROP INDEX IF EXISTS #{index_name}")
+      end)
+
+      UnboxedRepo.query!("CREATE INDEX CONCURRENTLY #{index_name} ON oban_jobs(id)")
+
+      UnboxedRepo.query!(
+        "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.#{index_name}'::regclass"
+      )
+
+      name = start_supervised_oban!(repo: UnboxedRepo, plugins: [Reindexer])
+
+      name
+      |> Registry.whereis({:plugin, Reindexer})
+      |> send(:reindex)
+
+      assert_receive {:event, :stop, _, %{plugin: Reindexer}}, 2_000
+
+      result = UnboxedRepo.query!("SELECT 1 FROM pg_class WHERE relname = '#{index_name}'")
+      assert result.rows == []
+
+      stop_supervised(name)
+    end
+
+    test "reindexing every index despite individual failures" do
+      indexes = ~w(oban_jobs_missing_index_a oban_jobs_missing_index_b)
+
+      name = start_supervised_oban!(plugins: [{Reindexer, indexes: indexes}])
+
+      name
+      |> Registry.whereis({:plugin, Reindexer})
+      |> send(:reindex)
+
+      assert_receive {:event, :stop, _, %{plugin: Reindexer, error: error}}, 2_000
+
+      assert [_, _] = error
 
       stop_supervised(name)
     end

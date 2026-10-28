@@ -45,6 +45,7 @@ if Code.ensure_loaded?(Igniter) do
     use Igniter.Mix.Task
 
     @known_repos [Ecto.Repo, AshPostgres.Repo, AshSqlite.Repo]
+    @supported_adapters [Ecto.Adapters.Postgres, Ecto.Adapters.MyXQL, Ecto.Adapters.SQLite3]
 
     @impl Igniter.Mix.Task
     def info(_argv, _composing_task) do
@@ -73,7 +74,18 @@ if Code.ensure_loaded?(Igniter) do
           engine = parse_engine(adapter, opts[:engine])
           notifier = parse_notifier(adapter, opts[:notifier])
 
-          conf_code = [engine: engine, notifier: notifier, queues: [default: 10], repo: repo]
+          conf_code =
+            quote do
+              [
+                engine: unquote(engine),
+                notifier: unquote(notifier),
+                queues: [default: 10],
+                lifeline: [rescue_after: {2, :hours}],
+                pruner: [max_age: {1, :day}],
+                repo: unquote(repo)
+              ]
+            end
+
           test_code = [testing: :manual]
 
           tree_code =
@@ -111,8 +123,8 @@ if Code.ensure_loaded?(Igniter) do
 
     defp extract_repo(igniter, app_name, nil) do
       case Igniter.Libs.Ecto.list_repos(igniter) do
-        {igniter, [repo | _]} ->
-          {:ok, repo, extract_adapter(igniter, repo)}
+        {igniter, repos} when repos != [] ->
+          find_supported_repo(igniter, app_name, repos)
 
         _ ->
           issue = """
@@ -134,6 +146,32 @@ if Code.ensure_loaded?(Igniter) do
 
         {false, _} ->
           {:error, Igniter.add_issue(igniter, "Provided repo (#{inspect(repo)}) doesn't exist")}
+      end
+    end
+
+    defp find_supported_repo(igniter, app_name, repos) do
+      with_adapters = Enum.map(repos, &{&1, extract_adapter(igniter, &1)})
+
+      case Enum.find(with_adapters, fn {_, adapter} -> adapter in @supported_adapters end) do
+        {repo, adapter} ->
+          {:ok, repo, adapter}
+
+        nil ->
+          unsupported_list =
+            Enum.map_join(with_adapters, "\n", fn {repo, adapter} ->
+              "  * #{inspect(repo)} (#{inspect(adapter)})"
+            end)
+
+          issue = """
+          No compatible Ecto repo found for #{inspect(app_name)}.
+
+          Oban requires PostgreSQL, MySQL, or SQLite3. Found repos with unsupported adapters:
+          #{unsupported_list}
+
+          Specify a compatible repo explicitly with: mix oban.install --repo MyApp.Repo
+          """
+
+          {:error, Igniter.add_issue(igniter, issue)}
       end
     end
 
@@ -202,7 +240,7 @@ else
       Mix.shell().error("""
       The task 'oban.install' requires igniter. Please install igniter and try again.
 
-      For more information, see: https://hexdocs.pm/igniter/readme.html#installation
+      For more information, see: https://igniter.hexdocs.pm/readme.html#installation
       """)
 
       exit({:shutdown, 1})

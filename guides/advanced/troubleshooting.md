@@ -13,19 +13,19 @@ There are two mechanisms to mitigate orphans:
    fetching more jobs, but executing jobs have up to the grace period to complete. The default
    value is `15000ms`, or 15 seconds.
 
-2. Use the [Lifeline plugin](Oban.Plugins.Lifeline.html) to automatically move those jobs back to
-   available so they can run again.
+2. Use the [Lifeline](Oban.Lifeline.html) to automatically move those jobs back to available so
+   they can run again.
 
 ```elixir
 config :my_app, Oban,
-    plugins: [Oban.Plugins.Lifeline],
+    lifeline: Oban.Lifeline,
     shutdown_grace_period: :timer.seconds(60),
     ...
 ```
 
 ## Jobs or Plugins aren't Running
 
-Sometimes `Cron` or `Pruner` plugins appear to stop working unexpectedly. Typically, this happens in
+Sometimes `Cron` or `Pruner` appear to stop working unexpectedly. Typically, this happens in
 systems with multi-node setups where "web" nodes only enqueue jobs while "worker" nodes are
 configured to run queues and plugins. Most plugins require leadership to function, so when a "web"
 node becomes leader the plugins go dormant.
@@ -64,7 +64,8 @@ Keep the default peer in production for better reliability and persistence acros
 
 Using PgBouncer's "Transaction Pooling" setup disables all of PostgreSQL's `LISTEN` and `NOTIFY`
 activity. Some functionality, such as triggering job execution, scaling queues, canceling jobs,
-etc. rely on those notifications.
+etc. rely on those notifications. The same applies to other transaction mode poolers, such as
+Supavisor.
 
 There are several options available to ensure functional notifications:
 
@@ -78,7 +79,10 @@ There are several options available to ensure functional notifications:
 3. Use a dedicated Repo that connects directly to the database, bypassing `PgBouncer`.
 
 If none of those options work, Oban's job staging will switch to `local` polling mode to ensure
-that queues keep processing jobs.
+that queues keep processing jobs. Leadership also degrades gracefully, though handover is slower
+without notifications-see [Leadership Without Notifications][lwn] in the clustering guide.
+
+[lwn]: clustering.html#leadership-without-notifications
 
 ## Unexpectedly Re-running All Migrations
 
@@ -91,7 +95,7 @@ migrations and find the last time you ran an Oban migration. Once you've found t
 e.g. `version: 10`, then you can set that as a comment on the `oban_jobs` table:
 
 ```sql
-COMMENT ON TABLE public.oban_jobs IS '10'"
+COMMENT ON TABLE public.oban_jobs IS '10'
 ```
 
 Once the comment is in place only the migrations from that version onward will
@@ -120,3 +124,26 @@ Look for these log messages confirming the switch to local mode:
 - Wait for leadership restablishment after a restart in development
 - Use `Oban.Peers.Global` in development
 - Fix clustering and pubsub notifications in production
+
+## High Query Volume from Busy Queues
+
+Queues fetch available jobs after a brief [dispatch_cooldown][dc], which defaults to `5ms`. That
+favors low latency between insertion and execution, but every fetch is a database query and a busy
+queue may fetch up to 200 times per second.
+
+Increasing the cooldown will batche demand into fewer, larger fetches. For example, a cooldown of
+`50ms` reduces fetch queries by roughly 10x:
+
+```elixir
+config :my_app, Oban,
+  dispatch_cooldown: 50,
+  ...
+```
+
+There are two trade-offs to consider. First, jobs start roughly one cooldown period after
+insertion. Second, the cooldown caps a queue's maximum throughput at approximately `(1000 /
+cooldown) * limit` jobs per second. Neither of these trade-offs matter unless jobs must start
+within milliseconds of insertion, or a queue runs many jobs that each finish faster than the
+cooldown itself.
+
+[dc]: Oban.html#start_link/1-twiddly-options

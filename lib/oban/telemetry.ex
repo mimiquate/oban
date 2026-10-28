@@ -161,9 +161,8 @@ defmodule Oban.Telemetry do
   All the Oban plugins emit telemetry events under the `[:oban, :plugin, *]` pattern (where `*` is
   either `:init`, `:start`, `:stop`, or `:exception`). You can filter out for plugin events by
   looking into the metadata of the event and checking the value of `:plugin`. The `:plugin` field
-  is the plugin module that emitted the event. For example, to get `Oban.Plugins.Cron` specific
-  events, you can filter for telemetry events with a metadata key/value of `plugin:
-  Oban.Plugins.Cron`.
+  is the plugin module that emitted the event. For example, to get `Oban.Cron` specific events, you
+  can filter for telemetry events with a metadata key/value of `plugin: Oban.Cron`.
 
   Oban emits the following telemetry event whenever a plugin executes (be sure to check the
   documentation for each plugin as each plugin can also add additional metadata specific to
@@ -180,8 +179,19 @@ defmodule Oban.Telemetry do
   | ------------ | --------------- | ----------------------------------------------------- |
   | `:init`      |                 | `:conf`, `:plugin`                                    |
   | `:start`     | `:system_time`  | `:conf`, `:plugin`                                    |
-  | `:stop`      | `:duration`     | `:conf`, `:plugin`                                    |
+  | `:stop`      | `:duration`     | `:conf`, `:plugin`, `:error`                          |
   | `:exception` | `:duration`     | `:conf`, `:plugin`, `:kind`, `:reason`, `:stacktrace` |
+
+  #### Metadata
+
+  * `:conf`, `:kind`, `:reason`, `:stacktrace` — see the explanation in notifier metadata above
+  * `:plugin` — the plugin module that emitted the event
+  * `:error` — the error that prevented a run from finishing its work, only present when a run
+    fails
+
+  A run that fails, e.g. because the database is unavailable, still emits a `:stop` event. Plugin
+  specific metadata is always present in `:stop` metadata, with empty or zeroed values when the
+  run failed, so handlers may match on the documented keys without a fallback clause.
 
   ## Peer Events
 
@@ -312,15 +322,24 @@ defmodule Oban.Telemetry do
   @typedoc """
   Available logging options.
   """
-  @type logger_opts :: [encode: boolean(), events: :all | [event_types()], level: Logger.level()]
+  @type logger_opts :: [
+          encode: boolean(),
+          events: :all | [event_types()],
+          level: Logger.level(),
+          oban_name: term()
+        ]
 
   @doc """
   The unique id used to attach telemetry logging.
 
-  This is the constant `"oban-default-logger"` and exposed for testing purposes.
+  Without an argument (or with `:all`) the id is the constant `"oban-default-logger"`. When an
+  Oban instance name is provided the id is suffixed with the inspected name, which allows multiple
+  scoped loggers to coexist.
   """
   @doc since: "1.19.0"
-  def default_handler_id, do: "oban-default-logger"
+  def default_handler_id(oban_name \\ :all)
+  def default_handler_id(:all), do: "oban-default-logger"
+  def default_handler_id(oban_name), do: "oban-default-logger-#{inspect(oban_name)}"
 
   @doc """
   Attaches a default structured JSON Telemetry handler for logging.
@@ -370,6 +389,7 @@ defmodule Oban.Telemetry do
   * `event` — `plugin:stop` or `plugin:exception`
   * `plugin` — the plugin module
   * `duration` — the runtime duration in microseconds
+  * `error` — a formatted error, only included when a run failed
 
   Other values may be included depending on the plugin.
 
@@ -388,6 +408,10 @@ defmodule Oban.Telemetry do
     `:plugin`, `:peer`, `:queue`, `:stager`, or `:all`. Defaults to `:all`.
 
   * `:level` — The log level to use for logging output, defaults to `:info`
+
+  * `:oban_name` — Scope the logger to a single Oban instance by name. Events for other instances
+    are ignored. Defaults to `:all`, which logs events from every instance and allows only one
+    logger to be attached at a time.
 
   ## Examples
 
@@ -410,6 +434,10 @@ defmodule Oban.Telemetry do
   Attach a logger with only `:notifier`, `:peer`, and `:stager` events logged:
 
       Oban.Telemetry.attach_default_logger(events: ~w(notifier peer stager)a)
+
+  Scope a logger to a single Oban instance:
+
+      Oban.Telemetry.attach_default_logger(oban_name: MyApp.Oban)
   """
   @doc since: "0.4.0"
   @spec attach_default_logger(Logger.level() | logger_opts()) :: :ok | {:error, :already_exists}
@@ -425,6 +453,7 @@ defmodule Oban.Telemetry do
       |> Keyword.put_new(:encode, true)
       |> Keyword.put_new(:events, :all)
       |> Keyword.put_new(:level, :info)
+      |> Keyword.put_new(:oban_name, :all)
 
     filter = opts[:events]
 
@@ -443,11 +472,18 @@ defmodule Oban.Telemetry do
           filter == :all or category in filter,
           do: [:oban, category | rest]
 
-    :telemetry.attach_many(default_handler_id(), events, &__MODULE__.handle_event/4, opts)
+    :telemetry.attach_many(
+      default_handler_id(opts[:oban_name]),
+      events,
+      &__MODULE__.handle_event/4,
+      opts
+    )
   end
 
   @doc """
   Undoes `Oban.Telemetry.attach_default_logger/1` by detaching the attached logger.
+
+  Pass the same `:oban_name` used when attaching to detach a scoped logger.
 
   ## Examples
 
@@ -456,19 +492,34 @@ defmodule Oban.Telemetry do
       :ok = Oban.Telemetry.attach_default_logger()
       :ok = Oban.Telemetry.detach_default_logger()
 
+  Detach a logger scoped to an Oban instance:
+
+      :ok = Oban.Telemetry.attach_default_logger(oban_name: MyApp.Oban)
+      :ok = Oban.Telemetry.detach_default_logger(oban_name: MyApp.Oban)
+
   Attempt to detach when a logger wasn't attached:
 
       {:error, :not_found} = Oban.Telemetry.detach_default_logger()
   """
   @doc since: "2.15.0"
-  @spec detach_default_logger() :: :ok | {:error, :not_found}
-  def detach_default_logger do
-    :telemetry.detach(default_handler_id())
+  @spec detach_default_logger(Keyword.t()) :: :ok | {:error, :not_found}
+  def detach_default_logger(opts \\ []) do
+    :telemetry.detach(default_handler_id(Keyword.get(opts, :oban_name, :all)))
   end
 
   @doc false
   @spec handle_event([atom()], map(), map(), Keyword.t()) :: term()
-  def handle_event([:oban, :job, event], measure, meta, opts) do
+  def handle_event(event, measure, meta, opts) do
+    case Keyword.get(opts, :oban_name, :all) do
+      :all ->
+        dispatch_event(event, measure, meta, opts)
+
+      name ->
+        if match?(%{conf: %{name: ^name}}, meta), do: dispatch_event(event, measure, meta, opts)
+    end
+  end
+
+  defp dispatch_event([:oban, :job, event], measure, meta, opts) do
     log(opts, fn ->
       details = Map.take(meta.job, ~w(attempt args id max_attempts meta queue tags worker)a)
 
@@ -499,7 +550,7 @@ defmodule Oban.Telemetry do
     end)
   end
 
-  def handle_event([:oban, :notifier, :switch], _measure, %{status: status}, opts) do
+  defp dispatch_event([:oban, :notifier, :switch], _measure, %{status: status}, opts) do
     log(opts, fn ->
       case status do
         :isolated ->
@@ -527,7 +578,7 @@ defmodule Oban.Telemetry do
     end)
   end
 
-  def handle_event([:oban, :peer, :election, :stop], _measure, meta, opts) do
+  defp dispatch_event([:oban, :peer, :election, :stop], _measure, meta, opts) do
     %{leader: leader, was_leader: was_leader} = meta
 
     message =
@@ -552,7 +603,7 @@ defmodule Oban.Telemetry do
     end
   end
 
-  def handle_event([:oban, :plugin, :exception], measure, meta, opts) do
+  defp dispatch_event([:oban, :plugin, :exception], measure, meta, opts) do
     log(opts, fn ->
       error =
         case meta do
@@ -572,21 +623,20 @@ defmodule Oban.Telemetry do
     end)
   end
 
-  def handle_event([:oban, :plugin, :stop], measure, meta, opts) do
+  defp dispatch_event([:oban, :plugin, :stop], measure, meta, opts) do
     %{conf: conf, plugin: plugin} = meta
 
     if function_exported?(plugin, :format_logger_output, 2) do
       log(opts, fn ->
-        formatted = plugin.format_logger_output(conf, meta)
-
         %{event: "plugin:stop", plugin: inspect(plugin)}
         |> Map.put(:duration, convert(measure.duration))
-        |> Map.merge(formatted)
+        |> Map.merge(plugin.format_logger_output(conf, meta))
+        |> Map.merge(error_output(meta))
       end)
     end
   end
 
-  def handle_event([:oban, :queue, :shutdown], measure, %{orphaned: [_ | _]} = meta, opts) do
+  defp dispatch_event([:oban, :queue, :shutdown], measure, %{orphaned: [_ | _]} = meta, opts) do
     log(opts, fn ->
       %{
         elapsed: measure.elapsed,
@@ -598,7 +648,7 @@ defmodule Oban.Telemetry do
     end)
   end
 
-  def handle_event([:oban, :stager, :switch], _measure, %{mode: mode}, opts) do
+  defp dispatch_event([:oban, :stager, :switch], _measure, %{mode: mode}, opts) do
     log(opts, fn ->
       case mode do
         :local ->
@@ -620,7 +670,10 @@ defmodule Oban.Telemetry do
     end)
   end
 
-  def handle_event(_event, _measure, _meta, _opts), do: :ok
+  defp dispatch_event(_event, _measure, _meta, _opts), do: :ok
+
+  defp error_output(%{error: error}), do: %{error: Exception.format_banner(:error, error)}
+  defp error_output(_meta), do: %{}
 
   defp log(opts, fun) do
     level = Keyword.fetch!(opts, :level)
