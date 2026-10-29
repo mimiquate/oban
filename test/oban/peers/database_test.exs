@@ -1,7 +1,7 @@
 defmodule Oban.Peers.DatabaseTest do
-  use Oban.Case
+  use Oban.Case, async: true
 
-  import ExUnit.CaptureLog
+  import Ecto.Query, only: [where: 2]
 
   alias Oban.Peer
   alias Oban.Peers.Database
@@ -13,7 +13,7 @@ defmodule Oban.Peers.DatabaseTest do
     conf = Oban.config(name)
 
     assert [_leader] =
-             [A, B, C]
+             [Peer.DB.A, Peer.DB.B, Peer.DB.C]
              |> Enum.map(&start_supervised_peer!(conf, &1))
              |> Enum.filter(&Database.leader?/1)
   end
@@ -24,16 +24,51 @@ defmodule Oban.Peers.DatabaseTest do
     conf = Oban.config(name)
 
     assert [_leader] =
-             [A, B, C]
+             [Peer.DB.A, Peer.DB.B, Peer.DB.C]
              |> Enum.map(&start_supervised_peer!(conf, &1))
              |> Enum.filter(&Database.leader?/1)
   end
 
-  defp start_supervised_peer!(conf, name) do
-    node = "web.#{name}"
-    conf = %{conf | node: node, peer: {Database, []}}
+  test "retaining leadership while the lease is held" do
+    name = start_supervised_oban!(peer: false)
+    conf = Oban.config(name)
 
-    start_supervised!({Peer, conf: conf, name: name})
+    peer = start_supervised_peer!(conf, Peer.DB.A)
+
+    assert Database.leader?(peer)
+
+    GenServer.call(peer, :election)
+
+    assert Database.leader?(peer)
+  end
+
+  test "conceding leadership after another node takes over the lease" do
+    name = start_supervised_oban!(peer: false)
+    conf = Oban.config(name)
+    peer = start_supervised_peer!(conf, Peer.DB.A)
+
+    assert Database.leader?(peer)
+
+    take_over(conf, expires_at: seconds_from_now(30))
+
+    GenServer.call(peer, :election)
+
+    refute Database.leader?(peer)
+    assert "web.B" == Database.get_leader(peer)
+  end
+
+  test "assuming leadership after another node's lease expires" do
+    name = start_supervised_oban!(peer: false)
+    conf = Oban.config(name)
+    peer = start_supervised_peer!(conf, Peer.DB.A)
+
+    assert Database.leader?(peer)
+
+    take_over(conf, expires_at: seconds_from_now(-1))
+
+    GenServer.call(peer, :election)
+
+    assert Database.leader?(peer)
   end
 
   test "dispatching leadership election events" do
@@ -48,29 +83,17 @@ defmodule Oban.Peers.DatabaseTest do
                     %{leader: true, peer: Database, was_leader: false}}
   end
 
-  test "gracefully handling a missing oban_peers table" do
-    mangle_peers_table!()
+  defp start_supervised_peer!(conf, name) do
+    node = "web.#{name}"
+    conf = %{conf | node: node, peer: {Database, []}}
 
-    logged =
-      capture_log(fn ->
-        name = start_supervised_oban!(peer: Database)
-        conf = Oban.config(name)
-
-        start_supervised!({Peer, conf: conf, name: Peer})
-
-        refute Database.leader?(Peer)
-      end)
-
-    assert logged =~ "leadership is disabled"
-  after
-    reform_peers_table!()
+    start_supervised!({Peer, conf: conf, name: name})
   end
 
-  defp mangle_peers_table! do
-    Repo.query!("ALTER TABLE oban_peers RENAME TO oban_reeps")
-  end
-
-  defp reform_peers_table! do
-    Repo.query!("ALTER TABLE oban_reeps RENAME TO oban_peers")
+  # Slightly invasive, but much easier than coordinating multiple supervised instances.
+  defp take_over(conf, expires_at: expires_at) do
+    "oban_peers"
+    |> where(name: ^inspect(conf.name))
+    |> Repo.update_all(set: [node: "web.B", expires_at: expires_at])
   end
 end

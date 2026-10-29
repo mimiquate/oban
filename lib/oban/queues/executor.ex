@@ -1,7 +1,9 @@
-defmodule Oban.Queue.Executor do
+defmodule Oban.Queues.Executor do
   @moduledoc false
 
-  alias Oban.{Backoff, Config, CrashError, Engine, Job}
+  import Oban.Period, only: [is_valid_period: 1]
+
+  alias Oban.{Backoff, Config, CrashError, Engine, Job, Period}
   alias Oban.{PerformError, TimeoutError, Worker}
 
   require Logger
@@ -164,8 +166,8 @@ defmodule Oban.Queue.Executor do
       {:error, _reason} = result ->
         %{exec | result: result, state: :failure, error: perform_error(worker, result)}
 
-      {:snooze, seconds} = result when is_integer(seconds) and seconds >= 0 ->
-        %{exec | result: result, state: :snoozed, snooze: seconds}
+      {:snooze, period} = result when is_valid_period(period) ->
+        %{exec | result: result, state: :snoozed, snooze: Period.to_seconds(period)}
 
       returned ->
         log_warning(exec, returned)
@@ -338,19 +340,18 @@ defmodule Oban.Queue.Executor do
   end
 
   defp measurements(exec) do
+    {memory, reductions} =
+      case Process.info(self(), [:memory, :reductions]) do
+        [memory: memory, reductions: reductions] -> {memory, reductions}
+        nil -> {0, 0}
+      end
+
     %{
       duration: exec.duration,
-      memory: info_for(:memory),
+      memory: memory,
       queue_time: exec.queue_time,
-      reductions: info_for(:reductions)
+      reductions: reductions
     }
-  end
-
-  defp info_for(item) do
-    case Process.info(self(), item) do
-      {^item, value} -> value
-      nil -> 0
-    end
   end
 
   defp log_warning(%__MODULE__{safe: true, worker: worker}, returned) do
@@ -365,7 +366,7 @@ defmodule Oban.Queue.Executor do
         - `{:error, reason}`,
         - `{:cancel, reason}`
         - `{:discard, reason}`
-        - `{:snooze, seconds}`
+        - `{:snooze, period}`
 
         Instead received:
 

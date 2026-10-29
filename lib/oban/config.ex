@@ -13,43 +13,57 @@ defmodule Oban.Config do
   @type t :: %__MODULE__{
           dispatch_cooldown: pos_integer(),
           engine: module(),
-          get_dynamic_repo: nil | (-> pid() | atom()) | {module(), atom(), list()},
           insert_trigger: boolean(),
-          log: false | Logger.level(),
           name: Oban.name(),
           node: String.t(),
           notifier: {module(), Keyword.t()},
           peer: {module(), Keyword.t()},
-          plugins: [module() | {module() | Keyword.t()}],
+          plugins: [module() | {module(), Keyword.t()}],
           prefix: false | String.t(),
           queues: Keyword.t(Keyword.t()),
           repo: module(),
           shutdown_grace_period: non_neg_integer(),
-          stage_interval: timeout(),
+          stager: false | {module(), Keyword.t()},
           testing: :disabled | :inline | :manual
         }
 
   defstruct dispatch_cooldown: 5,
-            engine: Oban.Engines.Basic,
+            engine: nil,
             get_dynamic_repo: nil,
             insert_trigger: true,
             log: false,
-            name: Oban,
+            name: nil,
             node: nil,
-            notifier: {Oban.Notifiers.Postgres, []},
-            peer: {Oban.Peers.Database, []},
+            notifier: nil,
+            peer: nil,
             plugins: [],
             prefix: "public",
             queues: [],
             repo: nil,
             shutdown_grace_period: :timer.seconds(15),
-            stage_interval: :timer.seconds(1),
+            stager: {Oban.Stager, []},
             testing: :disabled
 
   @cron_keys ~w(crontab timezone)a
   @log_levels ~w(false emergency alert critical error warning warn notice info debug)a
-  @renamed [{:engine, Oban.Queue.BasicEngine}, {:notifier, {Oban.PostgresNotifier, []}}]
+  @repo_opts [log: :log, dynamic_repo: :get_dynamic_repo]
   @testing_modes ~w(manual inline disabled)a
+
+  @service_plugins [
+    cron: Oban.Cron,
+    pruner: Oban.Pruner,
+    lifeline: Oban.Lifeline,
+    reindexer: Oban.Reindexer
+  ]
+
+  @renamed_modules [engine: Oban.Queue.BasicEngine, notifier: {Oban.PostgresNotifier, []}]
+
+  @renamed_plugins [
+    {Oban.Plugins.Cron, Oban.Cron},
+    {Oban.Plugins.Lifeline, Oban.Lifeline},
+    {Oban.Plugins.Pruner, Oban.Pruner},
+    {Oban.Plugins.Reindexer, Oban.Reindexer}
+  ]
 
   @doc """
   Generate a Config struct after normalizing and verifying Oban options.
@@ -64,7 +78,11 @@ defmodule Oban.Config do
   """
   @spec new([Oban.option()]) :: t()
   def new(opts) when is_list(opts) do
-    opts = normalize(opts)
+    opts =
+      opts
+      |> normalize()
+      |> Keyword.put_new(:engine, Oban.Engines.Basic)
+      |> Keyword.put_new(:name, Oban)
 
     opts =
       case opts[:engine] do
@@ -82,6 +100,8 @@ defmodule Oban.Config do
 
         _ ->
           opts
+          |> Keyword.put_new(:notifier, {Oban.Notifiers.Postgres, []})
+          |> Keyword.put_new(:peer, {Oban.Peers.Database, []})
       end
 
     opts =
@@ -90,7 +110,7 @@ defmodule Oban.Config do
         |> Keyword.put(:peer, {Oban.Peers.Isolated, [leader?: false]})
         |> Keyword.put(:plugins, [])
         |> Keyword.put(:queues, [])
-        |> Keyword.put(:stage_interval, :infinity)
+        |> Keyword.put(:stager, false)
       else
         opts
       end
@@ -116,7 +136,7 @@ defmodule Oban.Config do
       iex> Oban.Config.validate(name: Oban)
       :ok
 
-      iex> Oban.Config.validate(name: Oban, log: false)
+      iex> Oban.Config.validate(name: Oban, prefix: "private")
       :ok
 
       iex> Oban.Config.validate(node: {:not, :binary})
@@ -127,34 +147,36 @@ defmodule Oban.Config do
 
   Validating plugin options:
 
-      iex> Oban.Config.validate(plugins: [{Oban.Plugins.Pruner, max_age: 60}])
+      iex> Oban.Config.validate(plugins: [{Oban.Pruner, max_age: {1, :day}}])
       :ok
 
-      iex> Oban.Config.validate(plugins: [{Oban.Plugins.Pruner, max_age: 0}])
-      {:error, "invalid value for :plugins, expected :max_age to be a positive integer, got: 0"}
+      iex> Oban.Config.validate(plugins: [{Oban.Pruner, max_age: 0}])
+      {:error, "invalid value for :plugins, expected :max_age to be a positive integer or {amount, unit} tuple, got: 0"}
   """
   @spec validate([Oban.option()]) :: :ok | {:error, String.t()}
   def validate(opts) when is_list(opts) do
-    opts = normalize(opts)
+    with :ok <- validate_unique_opts(opts) do
+      opts = normalize(opts)
 
-    Validation.validate_schema(opts,
-      dispatch_cooldown: :pos_integer,
-      engine: {:behaviour, Oban.Engine},
-      get_dynamic_repo: {:or, [:falsy, {:function, 0}, :mfa]},
-      insert_trigger: :boolean,
-      log: {:enum, @log_levels},
-      name: :any,
-      node: {:pattern, ~r/^\S+$/},
-      notifier: {:behaviour, Oban.Notifier},
-      peer: {:or, [:falsy, {:behaviour, Oban.Peer}]},
-      plugins: {:custom, &validate_plugins/1},
-      prefix: {:or, [:falsy, :string]},
-      queues: {:custom, &validate_queues(opts, &1)},
-      repo: {:module, [config: 0]},
-      shutdown_grace_period: :non_neg_integer,
-      stage_interval: :timeout,
-      testing: {:enum, @testing_modes}
-    )
+      Validation.validate_schema(opts,
+        dispatch_cooldown: :pos_integer,
+        engine: {:behaviour, Oban.Engine},
+        get_dynamic_repo: {:or, [:falsy, {:function, 0}, :mfa]},
+        insert_trigger: :boolean,
+        log: {:enum, @log_levels},
+        name: :any,
+        node: {:pattern, ~r/^\S+$/},
+        notifier: {:behaviour, Oban.Notifier},
+        peer: {:or, [:falsy, {:behaviour, Oban.Peer}]},
+        plugins: {:custom, &validate_plugins/1},
+        prefix: {:or, [:falsy, :string]},
+        queues: {:custom, &validate_queues(opts, &1)},
+        repo: {:module, [config: 0]},
+        shutdown_grace_period: :non_neg_integer,
+        stager: {:custom, &validate_stager/1},
+        testing: {:enum, @testing_modes}
+      )
+    end
   end
 
   @doc false
@@ -210,7 +232,9 @@ defmodule Oban.Config do
   # Validation
 
   defp validate_plugins(plugins) do
-    Validation.validate(:plugins, plugins, &validate_plugin/1)
+    with :ok <- validate_unique_plugins(plugins) do
+      Validation.validate(:plugins, plugins, &validate_plugin/1)
+    end
   end
 
   defp validate_plugin(plugin) when not is_tuple(plugin), do: validate_plugin({plugin, []})
@@ -237,6 +261,30 @@ defmodule Oban.Config do
       true ->
         :ok
     end
+  end
+
+  defp validate_stager({module, opts}) when is_atom(module) do
+    name = inspect(module)
+
+    cond do
+      not Code.ensure_loaded?(module) ->
+        {:error, "stager #{name} could not be loaded"}
+
+      not Keyword.keyword?(opts) ->
+        {:error, "expected #{name} options to be a keyword list, got: #{inspect(opts)}"}
+
+      function_exported?(module, :validate, 1) ->
+        module.validate(opts)
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_stager(false), do: :ok
+
+  defp validate_stager(stager) do
+    {:error, "expected :stager to be a module or {module, opts} tuple, got: #{inspect(stager)}"}
   end
 
   defp validate_queues(opts, queues) do
@@ -283,54 +331,66 @@ defmodule Oban.Config do
     end
   end
 
+  defp validate_unique_opts(opts) do
+    keys = Keyword.keys(opts)
+    dupe = keys -- Enum.uniq(keys)
+
+    if Enum.empty?(dupe) do
+      :ok
+    else
+      {:error, "found duplicate options: #{inspect(dupe)}"}
+    end
+  end
+
+  defp validate_unique_plugins(plugins) when is_list(plugins) do
+    modules =
+      Enum.map(plugins, fn
+        {module, _opts} -> module
+        module -> module
+      end)
+
+    dupe = modules -- Enum.uniq(modules)
+
+    if Enum.empty?(dupe) do
+      :ok
+    else
+      {:error, "found duplicate plugins: #{inspect(dupe)}"}
+    end
+  end
+
+  defp validate_unique_plugins(_plugins), do: :ok
+
   # Normalization
 
   defp normalize(opts) do
     opts
-    |> crontab_to_plugin()
+    |> normalize_repo()
     |> normalize_notifier()
     |> normalize_peer()
-    |> Keyword.put_new(:node, node_name())
-    |> Keyword.update(:queues, [], &normalize_queues/1)
-    |> Keyword.update(:plugins, [], &normalize_plugins/1)
+    |> normalize_stager()
+    |> normalize_queues()
+    |> normalize_plugins()
     |> Keyword.delete(:circuit_backoff)
-    |> stager_to_interval()
-    |> Enum.reject(&(&1 in @renamed))
+    |> Keyword.put_new(:node, node_name())
+    |> Enum.reject(&(&1 in @renamed_modules))
   end
 
-  defp crontab_to_plugin(opts) do
-    case {opts[:plugins], opts[:crontab]} do
-      {plugins, [_ | _]} when is_list(plugins) or is_nil(plugins) ->
-        {cron_opts, base_opts} = Keyword.split(opts, @cron_keys)
-
-        plugin = {Oban.Plugins.Cron, cron_opts}
-
-        Keyword.update(base_opts, :plugins, [plugin], &[plugin | &1])
+  defp normalize_repo(opts) do
+    case Keyword.get(opts, :repo) do
+      {repo, repo_opts} when is_atom(repo) and is_list(repo_opts) ->
+        opts
+        |> Keyword.put(:repo, repo)
+        |> merge_repo_opts(repo_opts)
 
       _ ->
-        Keyword.drop(opts, @cron_keys)
+        opts
     end
   end
 
-  defp stager_to_interval(opts) do
-    cond do
-      Keyword.has_key?(opts, :poll_interval) ->
-        opts
-        |> Keyword.put_new(:stage_interval, opts[:poll_interval])
-        |> Keyword.delete(:poll_interval)
-
-      Keyword.keyword?(opts[:plugins]) ->
-        {stager_opts, opts} = pop_in(opts, [:plugins, Oban.Stager])
-
-        if is_list(stager_opts) and Keyword.has_key?(stager_opts, :interval) do
-          Keyword.put_new(opts, :stage_interval, stager_opts[:interval])
-        else
-          opts
-        end
-
-      true ->
-        opts
-    end
+  defp merge_repo_opts(opts, repo_opts) do
+    Enum.reduce(repo_opts, opts, fn {key, value}, opts ->
+      Keyword.put(opts, Keyword.get(@repo_opts, key, key), value)
+    end)
   end
 
   defp normalize_notifier(opts) do
@@ -364,24 +424,149 @@ defmodule Oban.Config do
     end
   end
 
-  defp normalize_queues(queues) when is_list(queues) do
-    for {name, value} <- queues do
-      opts = if is_integer(value), do: [limit: value], else: value
+  defp normalize_stager(opts) do
+    {stag_interval, opts} = Keyword.pop(opts, :stage_interval)
+    {poll_interval, opts} = Keyword.pop(opts, :poll_interval)
+    {plugin_opts, opts} = pop_stager_plugin(opts)
 
-      {name, opts}
+    legacy_interval = stag_interval || poll_interval || plugin_opts[:interval]
+
+    stager =
+      case Keyword.get(opts, :stager, []) do
+        stager when stager in [false, nil] ->
+          stager
+
+        stager ->
+          {module, stager_opts} = normalize_service(stager, Oban.Stager)
+
+          {module, put_legacy_interval(stager_opts, legacy_interval)}
+      end
+
+    Keyword.put(opts, :stager, stager)
+  end
+
+  defp pop_stager_plugin(opts) do
+    case Keyword.get(opts, :plugins) do
+      plugins when is_list(plugins) ->
+        {stagers, plugins} = Enum.split_with(plugins, &stager_plugin?/1)
+
+        {stager_plugin_opts(stagers), Keyword.put(opts, :plugins, plugins)}
+
+      _plugins ->
+        {[], opts}
     end
   end
 
-  defp normalize_queues(queues), do: queues || []
+  defp stager_plugin?({Oban.Stager, _opts}), do: true
+  defp stager_plugin?(plugin), do: plugin == Oban.Stager
+
+  defp stager_plugin_opts([{_module, opts} | _rest]) when is_list(opts), do: opts
+  defp stager_plugin_opts(_stagers), do: []
+
+  defp put_legacy_interval(stager_opts, interval)
+       when is_list(stager_opts) and not is_nil(interval) do
+    Keyword.put_new(stager_opts, :interval, interval)
+  end
+
+  defp put_legacy_interval(stager_opts, _interval), do: stager_opts
+
+  defp normalize_queues(opts) do
+    case Keyword.get(opts, :queues) do
+      {module, queue_opts} when is_atom(module) and is_list(queue_opts) ->
+        opts
+        |> Keyword.put(:queues, [])
+        |> put_plugin({module, queue_opts})
+
+      queues when is_list(queues) ->
+        normalized =
+          for {name, value} <- queues do
+            opts = if is_integer(value), do: [limit: value], else: value
+
+            {name, opts}
+          end
+
+        Keyword.put(opts, :queues, normalized)
+
+      queues when queues in [nil, false] ->
+        Keyword.put(opts, :queues, [])
+
+      _other ->
+        opts
+    end
+  end
 
   # Manually specified plugins will be overwritten by auto-specified plugins unless we reverse the
   # plugin list. The order doesn't matter as they are supervised one-for-one.
-  defp normalize_plugins(plugins) when is_list(plugins) do
-    plugins
-    |> Enum.map(&if is_atom(&1), do: {&1, []}, else: &1)
-    |> Enum.reverse()
-    |> Enum.uniq()
+  defp normalize_plugins(opts) do
+    opts
+    |> normalize_crontab()
+    |> normalize_services()
+    |> Keyword.update(:plugins, [], fn
+      plugins when is_list(plugins) ->
+        renamer = fn
+          {module, opts} -> {rename_plugin(module), opts}
+          module when is_atom(module) -> {rename_plugin(module), []}
+          other -> other
+        end
+
+        plugins
+        |> Enum.map(renamer)
+        |> Enum.reverse()
+        |> Enum.uniq()
+
+      plugins ->
+        plugins || []
+    end)
   end
 
-  defp normalize_plugins(plugins), do: plugins || []
+  defp rename_plugin(module), do: Keyword.get(@renamed_plugins, module, module)
+
+  defp normalize_crontab(opts) do
+    case {opts[:plugins], opts[:crontab]} do
+      {plugins, [_ | _]} when is_list(plugins) or is_nil(plugins) ->
+        {cron_opts, base_opts} = Keyword.split(opts, @cron_keys)
+
+        plugin = {Oban.Cron, cron_opts}
+
+        Keyword.update(base_opts, :plugins, [plugin], &[plugin | &1])
+
+      _ ->
+        Keyword.drop(opts, @cron_keys)
+    end
+  end
+
+  defp normalize_services(opts) do
+    Enum.reduce(@service_plugins, opts, fn {key, module}, opts ->
+      case Keyword.fetch(opts, key) do
+        :error ->
+          opts
+
+        {:ok, false} ->
+          Keyword.delete(opts, key)
+
+        {:ok, value} ->
+          opts
+          |> Keyword.delete(key)
+          |> put_service_plugin(normalize_service(value, module))
+      end
+    end)
+  end
+
+  defp normalize_service({module, opts}, _default) when is_atom(module), do: {module, opts}
+  defp normalize_service(module, _default) when is_atom(module), do: {module, []}
+  defp normalize_service(opts, module), do: {module, opts}
+
+  defp put_plugin(opts, plugin) do
+    case Keyword.get(opts, :plugins) do
+      plugins when is_list(plugins) -> Keyword.put(opts, :plugins, [plugin | plugins])
+      _falsy -> Keyword.put(opts, :plugins, [plugin])
+    end
+  end
+
+  defp put_service_plugin(opts, plugin) do
+    case Keyword.get(opts, :plugins) do
+      false -> opts
+      _plug -> put_plugin(opts, plugin)
+    end
+  end
 end

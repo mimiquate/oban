@@ -1,125 +1,376 @@
-# Changelog for Oban v2.20
+# Changelog for Oban v2.24
 
 _🌟 Looking for changes to [Oban Pro][pro]? Check the [Oban.Pro Changelog][opc] 🌟_
 
-This release brings a fantastic new helper function, an optional migration to aid pruning, some
-stability improvements, and a bevy of documentation updates.
+This release unifies configuration for queues, repos, and services, swaps opaque timing integers
+for readable durations, and backports per-entry cron timezones and attempt-preserving snoozes from
+Oban Pro.
 
-See the [Upgrade Guide](v2-20.html) for _optional_ upgrade instructions.
+## ⚙️ Unified Service Configuration
 
-## 🦋 Update Job
+Configuration for queues, repos, and all services (formerly "plugins") is now entirely unified.
+This is a massive syntactic change, but it isn't all sugar. There's purpose behind the unification
+and the configuration hoisting.
 
-This introduces the `Oban.update_job/2,3` function to simplify updating existing jobs while
-ensuring data consistency and safety. Previously, updating jobs required manually constructing
-change operations or complex queries that could lead to race conditions or invalid state changes.
-
-Only a curated subset of job fields, e.g. `:args`, `:max_attempts`, `:meta`, etc. may be updated
-and they use the same validation rules as insertion to prevent invalid data. Updates are also
-wrapped in a transaction with locking clauses to prevent concurrent modifications.
-
-The function supports direct map changes:
+Functionality like pruning jobs and rescuing orphaned jobs is essential to running Oban, and it
+shouldn't be an optional afterthought that's demoted as a "plugin" and buried in a guide. Now
+services are top level configuration just like the `engine`, `notifier`, and `peer`:
 
 ```elixir
-Oban.update_job(job, %{priority: 0, tags: ["urgent"]})
+config :my_app, Oban,
+  cron: [crontab: [{"0 2 * * *", MyApp.Nightly}]],
+  pruner: [max_age: {7, :days}],
+  lifeline: [rescue_after: {30, :minutes}],
+  reindexer: Oban.Reindexer,
+  ...
 ```
 
-It also has a convenient function-based mode for dynamic changes:
+This configuration style should look familiar to anybody using [`oban-py`][py]. Building it is
+where we realized that these services are core functionality (in fact, it doesn't even have
+plugins).
+
+Service module names are flatter as well. Since they're not considered plugins anymore, the
+`Plugin` namespace was a confusing misnomer—so `Oban.Plugins.Cron` is simply `Oban.Cron`,
+`Oban.Plugins.Pruner` is now `Oban.Pruner`, and so on.
+
+Along with keyword options, the unified syntax supports bare modules, `{module, opts}` tuples, and
+disabling functionality altogether by passing `false`. The tuple variant makes it especially easy
+to swap core services out for alternatives (particularly useful for Pro 😉):
+
+```diff
+config :my_app, Oban,
++ engine: Oban.Pro.Engine,
+- cron: {Oban.Cron, crontab: [...]},
++ cron: {Oban.Pro.Cron, crontab: [...]},
+- lifeline: Oban.Lifeline,
++ lifeline: Oban.Pro.Lifeline,
+- pruner: {Oban.Pruner, ...},
++ pruner: {Oban.Pro.Pruner, ...},
+- queues: [...]
++ queues: {Oban.Pro.Queues, queues: [...]}
+```
+
+You'll see more about that in the Pro v1.8 release as well.
+
+Finally, the `repo` option got the same treatment. Both `log` and `get_dynamic_repo` were really
+repo options, and the stand-alone `log` option was genuinely confusing. Now you can use the tuple
+format to pass those options through `:repo` directly:
 
 ```elixir
-Oban.update_job(job, fn job ->
-  %{meta: Map.put(job.meta, "processed_by", current_node())}
-end)
+repo: {MyApp.Repo, log: false, dynamic_repo: fn -> MyApp.Repo end}
 ```
 
-## ❄️ Unique State Groups
+Don't worry, these **changes are fully backward compatible**. Oban transparently rewrites older
+configuration formats into the correct format, all of the old plugin modules have backward
+compatible shims, and you can still provide `plugins` beyond the standard services.
 
-There are now named unique state groups to replace custom state lists for unique jobs, promoting
-better uniqueness design and reducing configuration errors.
+[py]: https://github.com/oban-bg/oban-py
 
-Previously, developers had to manually specify lists of job states for uniqueness, which was
-error-prone and could lead to subtle bugs when states were omitted or incorrectly combined. The
-new predefined groups ensure correctness and consistency across applications.
+## 🎁 Backports from Oban Pro
 
-The new state groups are:
+Two long-standing Pro features are now built into Oban. They're small quality-of-life fixes that
+most people run into eventually, which makes them a better fit for core.
 
-- **`:all`** - All job states
-- **`:incomplete`** - Jobs that haven't finished (`~w(available scheduled executing retryable)a`)
-- **`:scheduled`** - Only scheduled jobs (`[:scheduled]`)
-- **`:successful`** - Jobs that completed successfully (`~w(available scheduled executing retryable completed)a`)
+First, individual crontab entries may override the scheduler's timezone, so a single `Cron`
+service can handle schedules in multiple zones:
 
-These groups eliminate the risk of accidentally creating incomplete or incorrect state lists that
-could allow duplicate jobs to be created when they shouldn't be, or prevent valid job creation
-when duplicates should be allowed.
+```elixir
+[
+  {"0 7 * * *", MyApp.Strictly, timezone: "America/Chicago"},
+  {"0 9 * * *", MyApp.Business, timezone: "Europe/London"}
+]
+```
 
-## 🪺 Nested Plugin Supervision
+Second, snoozing no longer consumes a job attempt. The `attempt` count is rolled back on snooze,
+so backoff stays accurate across snoozes and the `max_attempts` value remains stable. Snoozing
+increments a `snoozed` count in job `meta`, which helps distinguish real attempts from snoozes and
+react accordingly:
 
-Plugins and the internal Stager are now nested within a secondary supervision tree to improve
-system resilience and stability.
+```elixir
+def perform(%Job{meta: %{"snoozed" => snoozed}}) when snoozed > 5 do
+  {:cancel, :snoozed_too_many_times}
+end
+```
 
-Previously, plugins were supervised directly under the main Oban supervisor alongside core
-process. This meant that plugin failures could potentially impact the entire Oban system, and
-frequent plugin restarts could trigger cascading failures in the primary supervision tree.
+## ⏱️ Readable Durations
 
-The new supervisor has more lenient restart limits to allow for more plugin restart attempts
-before giving up. This change makes Oban more robust in production environments where plugins may
-experience transient failures due to database or connectivity issues.
+Over time, all of the Oban functions that accept durations have started to accept periods in the
+`{value, unit}` tuple format as well. That convention now extends to timing options for services
+like `Oban.Pruner`, so the numbers in your config are readable without mental math:
 
-## v2.20.1 — 2025-08-15
+```elixir
+config :my_app, Oban,
+  pruner: [max_age: {7, :days}, interval: {1, :minute}],
+  lifeline: [rescue_after: {30, :minutes}]
+```
 
-### Bug Fixes
+The format is public, centralized, and documented as `Oban.Period` now, so you can use it in
+plugins and application code as well. It sports units from seconds through months, along with
+helpers to convert into either seconds or milliseconds (whereas Elixir's newer `to_timeout` always
+generates milliseconds, and only exists on v1.17+):
 
-- [Worker] Handle missing fields in unique Worker validation.
+```elixir
+Oban.Period.to_seconds({2, :hours})
+#=> 7200
 
-  Workers that specified `keys` without `fields` would fail validation at compile time. Now
-  default values are considered for `use Oban.Worker` as well as `Job.new/2`.
+Oban.Period.to_milliseconds({5, :minutes})
+#=> 300_000
+```
 
-## v2.20.0 — 2025-08-13
+## v2.24.2 - 2026-10-14
 
 ### Enhancements
 
-- `Migration` Add V13 migration for indexing cancelled and discarded states.
+- [Docs] Publish Markdown documentation alongside HTML
 
-  A new V13 migration adds compound indexes to significantly improve `Oban.Plugins.Pruner`
-  performance when cleaning up `discarded` and `cancelled` jobs. This is especially beneficial for
-  applications that process large volumes of jobs and retain them for extended periods.
-
-- `Repo` Expose dynamic repo switching as `with_dynamic_repo/2`
-
-  The function was previously internal, which made impossible to use in external modules or extend
-  upon. Now custom plugins and extensions can use `Repo.with_dynamic_repo/2` to use the configured
-  dynamic repo options.
+  Docs are now also generated as Markdown, including an `llms.txt` index, which makes the modules
+  and guides easier to consume by LLMs and other tooling.
 
 ### Bug Fixes
 
-- [Oban] Allow `insert_all/1,3` via Oban facade
+- [Dolphin] Prevent deadlocks between concurrent fetches and inserts
 
-  The `insert_all/1` and `insert_all/3` function variants were missing from the generated Oban
-  facade functions when using a named instance.
+  MySQL could plan the fetch update as a full table scan, either when the fetched ids covered
+  most of the table or when statistics underestimated it, such as after pruning. The scan locked
+  rows held by other producers and uncommitted inserts, which caused fetches to wait across
+  queues and deadlock. The update now looks up each fetched job by primary key.
 
-- [Testing] Generate correct `perform_job/1,2,3` clauses.
+- [Engine] Preserve meta updates during execution on snooze
 
-  The `perform_job/2,3` clauses generated by `use Oban.Testing` didn't handle the `perform_job/2`
-  variant designed to run jobs created with `build_job/3`. This caused test failures when trying
-  to execute jobs built using the `build_job/3` helper function.
+  Snoozing a job overwrote its meta with the values it had when execution started, discarding any
+  changes made during execution. Each engine now snoozes with a targeted update.
 
-  The fix generates the missing `perform_job/2` clause along with a convenient `perform_job/1`
-  variant, ensuring all testing scenarios work seamlessly regardless of how jobs are constructed.
+- [Lite] Match `nil` arg values for uniqueness
 
-- [Testing] Restrict inline execution to `available` and `scheduled` states.
+  Unique jobs with `args` that contained a `nil` value wouldn't conflict with existing jobs, which
+  caused duplicates. The comparison now checks JSON types, which also prevents `1` from matching
+  `true`.
 
-  Jobs in the `completed` state or other non-runnable states were incorrectly attempted by the
-  inline engine, potentially causing errors or unexpected behavior during testing.
+- [Queues] Release jobs that exit before a pkill is handled
 
-- [Worker] Disallow `:keys` when `:fields` doesn't contain `:args` or `:meta`
+  A job whose process exited just before the producer handled its `pkill` stayed in the queue's
+  running list indefinitely. It's now released like any other finished job.
 
-  Unique job configurations using `:keys` were allowed even when `:fields` didn't include `:args`
-  or `:meta`, which would result in runtime errors since keys can only extract values from these
-  keyable fields.
+## v2.24.1 - 2026-09-03
 
-- [Cron] Fix error message when the crontab has an invalid range.
+### Bug Fixes
 
-  Cron validation errors for invalid ranges were returning exception structs instead of readable
-  error messages, making it difficult to understand and fix crontab configuration issues.
+- [Engine] Prevent newer execution from overwriting
+
+  Acking now verifies that the database hasn't been updated by another execution. Writes from a
+  new executor will no longer transition an acked job, e.g. erroring or snoozing a job back out of
+  `completed`.
+
+  This applies to ack operations in `Basic`, `Dolphin`, and `Lite` engines.
+
+- [Notifier] Track notify listeners in isolated registry
+
+  Listeners were tracked within each notifier process, which was lost if the notifier crashed.
+  Registration now lives in a dedicated registry, owne by the Oban application, which is immune to
+  process crashes.
+
+- [Notifier] Normalize notifier exits into error tuples
+
+  Notifier callbacks through the notifier process could exit if it crashed or timed out, leaving
+  callers to guard themselves with a try/catch.
+
+  Now, exits are caught in the Notifier itself, and returned as an error tuple. Postgres and PG
+  notifiers also no longer raise when their registered state is gone.
+
+- [Queues] Allow dispatch_cooldown when starting queues
+
+  The `dispatch_cooldown` option was silently ignored for static queues, and loudly failed
+  validation for dynamic queues. The option was always threaded through to the producer, and now
+  they pass validation.
+
+## v2.24.0 - 2026-08-25
+
+### Changes
+
+- [Oban] Top-level config for maintenance plugins
+
+  Promote the common maintenance plugins to first-class configuration keys: `cron`, `pruner`,
+  `lifeline`, and `reindexer`. Each desugars into a standard plugin entry and accepts the same
+  forms used elsewhere in Oban:
+
+      config :my_app, Oban,
+        cron: [crontab: [{"0 2 * * *", MyApp.Nightly}]],
+        pruner: [max_age: 60 * 60 * 24 * 7]
+
+  A keyword list configures the default plugin, and a `module` or `{module, opts}` tuple can
+  configure an alternative (making it an easy switch for Oban Pro, e.g. `lifeline:
+  Oban.Pro.Lifeline`).
+
+- [Oban] Accept repo options through {repo, opts} tuple
+
+  Configure repo-level options like logging and dynamic repo directly on the `:repo` key instead
+  of at the top level:
+
+      repo: {MyApp.Repo, log: false, dynamic_repo: fn -> MyApp.Repo end}
+
+  The top-level `log` and `get_dynamic_repo` keys are soft-deprecated. They continue to work for
+  backward compatibility, but the tuple form is now preferred and documented, keeping repo
+  concerns grouped with the repo.
+
+- [Oban] Accept a module for the top-level :queues option
+
+  The `:queues` option now accepts a `{module, options}` tuple in addition to a static keyword list,
+  which hands queue management to an alternative implementation such as Oban Pro's Queues:
+
+      queues: {Oban.Pro.Queues, queues: [default: 10]}
+
+  The module is started as a plugin and controls which queues run, while a static keyword list
+  keeps the built-in behavior of starting the listed queues on init. Queues run regardless of the
+  `:plugins` setting in either form.
+
+  Setting `plugins: false` now disables plugins configured through top-level servic keys, e.g.
+  `:cron` or `:pruner`, rather than crashing during normalization.
+
+- [Oban] Rename maintenance plugins to top-level modules
+
+  Plugins configured through top-level service keys now live directly in the Oban namespace:
+
+      Oban.Plugins.Cron      -> Oban.Cron
+      Oban.Plugins.Lifeline  -> Oban.Lifeline
+      Oban.Plugins.Pruner    -> Oban.Pruner
+      Oban.Plugins.Reindexer -> Oban.Reindexer
+
+  The old modules are deprecated and delegate to the new ones, and legacy module names in
+  `:plugins` translate to the renamed version automatically. Because the renamed module is what
+  runs, plugin telemetry metadata and registry keys report the new names.
+
+- [Oban] Expose stager as a top-level service option
+
+  Previously staging could only be configured through the `stage_interval` option, which is
+  inconsistent with other services like cron, pruner, and lifeline. The stager now accepts options
+  directly, e.g. `stager: [interval: 5000]`, `false` to disable it, or `{module, opts}` tuple for
+  alternative implementations.
+
+  The `stage_interval` option is soft-deprecated but still accepted, along with the legacy
+  `poll_interval` and older plugin style.
+
+- [Queues] Rename `Oban.Midwife` to `Oban.Queues`
+
+  Queue supervision moved from the internal `Midwife` to the public `Oban.Queues`. It takes the
+  queues it starts as an option rather than reading them from the config.
+
+  All internal queue modules moved to the `Oban.Queues.*` namespace to sit under the service that
+  owns them, matching the naming style of other modules.
+
+### Enhancements
+
+- [Cron] Support per-entry timezones in the crontab
+
+  Individual crontab entries may now override the plugin's timezone with a `:timezone` option,
+  e.g. `{"0 9 * * *", MyApp.Worker, timezone: "America/Chicago"}`. Previously every entry was
+  evaluated in a single configured timezone, which forced a separate Cron instance for each zone.
+
+- [Worker] Roll back `attempt` and count snoozes on snooze
+
+  Snoozing incremented `max_attempts` inflated retry timing and skewed backoff with each snooze.
+  Now snoozing matches Oban Pro and the `attempt` is rolled back, so a snooze never consumes an
+  attempt and backoff stays accurate. Each snooze also increments a `snoozed` count in the job's
+  `meta`.
+
+- [Job] Add `scheduled_in` for jobs and testing
+
+  Introduce `scheduled_in` as the documented way to schedule a job for a relative time, replacing
+  the awkward `scheduled_at`/`schedule_in` naming split that frequently confused people.
+
+  The legacy `schedule_in` option is still accepted and rewritten transparently, so existing code
+  continues to work.
+
+  Testing helpers gain a matching `scheduled_in` so assertions can use a relative offset instead
+  of computing an absolute `DateTime`:
+
+      assert_enqueued worker: MyApp.Worker, scheduled_in: 3600
+      assert_enqueued worker: MyApp.Worker, scheduled_in: {1, :hour}
+      assert_enqueued worker: MyApp.Worker, scheduled_in: {1, :hour, delta: 10}
+
+  The value accepts seconds, a `{amount, unit}` period tuple, and an optional `delta` for the
+  timestamp comparison window.
+
+- [Job] Restrict unique warnings to insertion states
+
+  Workers with custom unique :states no longer warn when they omit incomplete states such as
+  `:executing`. Uniqueness is only checked at insertion, so combinations of `:available`,
+  `:scheduled`, and `:suspended` are valid.
+
+  A warning is now emitted only when the configuration omits every insertion state, such as
+  [:completed], which allows duplicates to go undetected. Unique period validation is also
+  consolidated through `Oban.Period`.
+
+- [Basic] Avoid starting a transaction on non-unique insert
+
+  Refactor the engine's insert path to avoid a pointless transaction when inserting jobs, and pass
+  extra options through to the `Repo.transaction/3` call when provided.
+
+- [Lifeline] Accept period durations for `rescue_after`
+
+  The Lifeline plugin's `rescue_after` now accepts an `Oban.Period` tuple like `{60, :minutes}` in
+  addition to a raw millisecond integer, matching the duration format already used by the pruner's
+  `max_age`.
+
+- [Pruner] Accept period durations for `max_age`
+
+  The pruner's `:max_age` now accepts a period tuple such as `{1, :day}` in addition to an integer
+  count of seconds, normalized internally via `Oban.Period.to_seconds/1`.
+
+- [Pruner] Accept period durations for plugin timing options
+
+  Pruner and Lifeline intervals, along with Reindexer timeouts, now accept Oban.Period tuples such
+  as `{30, :seconds}` in addition to millisecond integers.
+
+- [Installer] Configure pruner and lifeline defaults
+
+  Generated config now enables pruning and orphan rescue out of the box using the new feature
+  keys, with conservative values: prune jobs after one day and rescue jobs only after two
+  hours.
+
+- [Period] Publicize duration conversion helpers
+
+  Oban.Period is now a public API for expressing and converting durations. It provides guards for
+  validating periods and functions for converting values to seconds or milliseconds:
+
+      Oban.Period.to_seconds({2, :hours})
+      Oban.Period.to_milliseconds({5, :minutes})
+
+  Periods accept raw integers or `{value, unit}` tuples, with singular and plural units ranging from
+  seconds through months. Months use a generic, non-portable 30-day window.
+
+### Bug Fixes
+
+- [Repo] Compile `expected_error?/1` clauses conditionally
+
+  The MySQL clause of `expected_error?/1` raised an "unused clause" warning in environments
+  without MyXQL, because the retryable error type narrows to only the loaded adapters and the
+  MyXQL struct could never match.
+
+  This moves the function into `Oban.Errors`, where the Postgres and MySQL clauses are now guarded
+  alongside the existing optional error list. Each clause only compiles when its adapter is
+  available, so absent adapters no longer produce a never-matched clause.
+
+- [Notifier] Correct `listen` and `unlisten` specs with error tuples
+
+  Without a running notifier process both `listen/2` and `unlisten/2` can return an `{:error,
+  Exception.t()}` tuple rather than `:ok`.
+
+- [Reindexer] Return :ok from checks without leadership
+
+  Previously, on non-leader nodes the reindexer check fell through with a `nil` return, which
+  telemetry reported as an error. Now the non-leader path returns `:ok`, matching all other
+  plugins.
+
+- [Telemetry] Normalize plugin telemetry metadata errors
+
+  Plugin runs that fail, e.g. because the database is unavailable, emit a `[:oban, :plugin,
+  :stop]` event with the plugin's usual metadata keys zeroed out and the underlying error added as
+  :error. Previously the keys were omitted entirely, which crashed handlers that matched on them.
+  That included the default logger, which telemetry then detached, silencing all Oban logging on
+  the node until restart.
+
+  The default logger now reports `:error` on `plugin:stop` events, and the `:error` value is the
+  error itself rather than an `{:error, reason}` tuple.
 
 [pro]: https://oban.pro
 [opc]: https://oban.pro/docs/pro/changelog.html

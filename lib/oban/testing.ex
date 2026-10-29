@@ -87,28 +87,39 @@ defmodule Oban.Testing do
       in_an_hour = DateTime.add(DateTime.utc_now(), 3600, :second)
       assert_enqueued worker: MyApp.Worker, scheduled_at: in_an_hour
 
+  Frequently it's more convenient to assert against a relative time rather than computing an
+  absolute timestamp. Use `scheduled_in` with the number of seconds from now, or a `{amount, unit}`
+  tuple, instead:
+
+      assert_enqueued worker: MyApp.Worker, scheduled_in: 3600
+      assert_enqueued worker: MyApp.Worker, scheduled_in: {1, :hour}
+
   By default, Oban will apply a 1 second delta to all timestamp fields of jobs, so that small
   deviations between the actual value and the expected one are ignored. You may configure this
-  delta by passing a tuple of value and a `delta` option (in seconds) to corresponding keyword:
+  delta by passing a `delta` option (in seconds) alongside the value:
 
       assert_enqueued worker: MyApp.Worker, scheduled_at: {in_an_hour, delta: 10}
+      assert_enqueued worker: MyApp.Worker, scheduled_in: {3600, delta: 10}
+      assert_enqueued worker: MyApp.Worker, scheduled_in: {1, :hour, delta: 10}
   """
 
   @moduledoc since: "0.3.0"
 
   import ExUnit.Assertions, only: [assert: 2, refute: 2, flunk: 1]
   import Ecto.Query, only: [order_by: 2, select: 3, where: 2, where: 3]
+  import Oban.Period, only: [is_valid_period: 1]
 
   alias Ecto.Changeset
 
-  alias Oban.{Config, Job, JSON, Queue.Executor, Repo, Worker}
+  alias Oban.{Config, Job, JSON, Period, Repo, Worker}
+  alias Oban.Queues.Executor
 
   @type perform_opts :: Job.option() | Oban.option()
 
-  @conf_keys []
-             |> Config.new()
+  @conf_keys Config.__struct__()
              |> Map.from_struct()
              |> Map.keys()
+             |> Enum.concat(~w(cron lifeline pruner reindexer)a)
 
   @json_fields ~w(args meta)a
   @timestamp_fields ~w(attempted_at cancelled_at completed_at discarded_at inserted_at scheduled_at)a
@@ -596,7 +607,7 @@ defmodule Oban.Testing do
         {:cancel, _value} -> true
         {:error, _value} -> true
         {:discard, _value} -> true
-        {:snooze, snooze} when is_integer(snooze) -> true
+        {:snooze, snooze} when is_valid_period(snooze) -> true
         :discard -> true
         _ -> false
       end
@@ -621,7 +632,26 @@ defmodule Oban.Testing do
   defp extract_conf(opts) do
     {conf_opts, opts} = Keyword.split(opts, @conf_keys)
 
-    {Config.new(conf_opts), opts}
+    {Config.new(conf_opts), normalize_scheduled(opts)}
+  end
+
+  defp normalize_scheduled(opts) do
+    case Keyword.pop(opts, :scheduled_in) do
+      {nil, opts} ->
+        opts
+
+      {value, opts} ->
+        {period, delta} =
+          case value do
+            {amount, unit, delta: delta} -> {{amount, unit}, delta}
+            {amount, delta: delta} -> {amount, delta}
+            period -> {period, 1}
+          end
+
+        scheduled_at = DateTime.add(DateTime.utc_now(), Period.to_seconds(period), :second)
+
+        Keyword.put(opts, :scheduled_at, {scheduled_at, delta: delta})
+    end
   end
 
   defp job_exists?(conf, opts) do
@@ -654,7 +684,7 @@ defmodule Oban.Testing do
   defp base_query(opts) do
     query =
       Job
-      |> where([j], j.state in ["available", "scheduled"])
+      |> where([j], j.state in ~w(available scheduled suspended))
       |> order_by(desc: :id)
 
     opts

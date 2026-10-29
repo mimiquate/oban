@@ -4,8 +4,8 @@ Periodic jobs allow you to schedule recurring tasks that execute on a predictabl
 one-time scheduled jobs, periodic jobs repeat automatically without requiring you to insert new
 jobs after each execution.
 
-Oban uses a [cron plugin](`Oban.Plugins.Cron`) to manage these recurring jobs, allowing you to
-define schedules using familiar cron syntax.
+Oban uses the [Cron](`Oban.Cron`) module to manage these recurring jobs, allowing you to define
+schedules using familiar cron syntax.
 
 ## Setting Up Periodic Jobs
 
@@ -19,15 +19,14 @@ Here's an example configuration:
 ```elixir
 config :my_app, Oban,
   repo: MyApp.Repo,
-  plugins: [
-    {Oban.Plugins.Cron,
-     crontab: [
-       {"* * * * *", MyApp.MinuteWorker},
-       {"0 * * * *", MyApp.HourlyWorker, args: %{custom: "arg"}},
-       {"0 0 * * *", MyApp.DailyWorker, max_attempts: 1},
-       {"0 12 * * MON", MyApp.MondayWorker, queue: :scheduled, tags: ["mondays"]},
-       {"@daily", MyApp.AnotherDailyWorker}
-     ]}
+  cron: [
+    crontab: [
+      {"* * * * *", MyApp.MinuteWorker},
+      {"0 * * * *", MyApp.HourlyWorker, args: %{custom: "arg"}},
+      {"0 0 * * *", MyApp.DailyWorker, max_attempts: 1},
+      {"0 12 * * MON", MyApp.MondayWorker, queue: :scheduled, tags: ["mondays"]},
+      {"@daily", MyApp.AnotherDailyWorker}
+    ]
   ]
 ```
 
@@ -144,8 +143,9 @@ For more in depth information, see the man documentation for `cron` and `crontab
 ## Caveats & Guidelines
 
 * **Timezone Considerations**: All schedules are evaluated as UTC unless a different timezone is
-  provided. See `Oban.Plugins.Cron` documentation for information about configuring a timezone to
-  ensure jobs run at the expected local time.
+  provided, either for the whole crontab or for individual entries with a `:timezone` option. See
+  `Oban.Cron` documentation for information about configuring a timezone to ensure jobs run at the
+  expected local time.
 
 * **Dual-Purpose Workers**: Workers can be used for both regular one-time jobs _and_ scheduled
   periodic jobs, as long as they're designed to accept different arguments appropriately. This

@@ -16,7 +16,7 @@
     <img alt="Hex Version" src="https://img.shields.io/hexpm/v/oban.svg">
   </a>
 
-  <a href="https://hexdocs.pm/oban">
+  <a href="https://oban.hexdocs.pm">
     <img alt="Hex Docs" src="http://img.shields.io/badge/hex.pm-docs-green.svg?style=flat">
   </a>
 
@@ -48,7 +48,7 @@
 > This README is for the unreleased main branch, please reference the [official documentation on
 > hexdocs][hexdoc] for the latest stable release.
 
-[hexdoc]: https://hexdocs.pm/oban/Oban.html
+[hexdoc]: https://oban.hexdocs.pm/Oban.html
 
 ---
 
@@ -132,26 +132,25 @@ without worrying about jobs being lost or orphaned due to crashes.
 An official set of extensions, plugins, and workers that expand what Oban is capable of is
 available as a licensed package. It includes features like:
 
-* 🖇️ [Workflows][wor]
-* 🎨 [Decorators][dec]
-* ⛓️  [Chains][cha]
-* 🏗️ [Structured Jobs][str]
-* 🪝 [Worker Hooks][hoo]
-* 🌎 [Global Limits][glo]
-* 🔪 [Queue Partitioning][par]
-* 🎢 [Dynamic Queues][dyn]
+- **Smart Engine** — Enables global concurrency, global rate limiting, queue partitioning, and
+  auto insert batching for truly distributed job processing.
 
-Plus [much more][ove]. Learn more about [Oban Pro](https://oban.pro#oban-pro)
+- **Pro Worker** — Extends workers with execution hooks, structured args, output recording,
+  encrypted args at rest, and chained execution.
 
-[cha]: https://oban.pro/docs/pro/Oban.Pro.Worker.html#module-chained-jobs
-[dec]: https://oban.pro/docs/pro/Oban.Pro.Decorator.html
-[dyn]: https://oban.pro/docs/pro/Oban.Pro.Plugins.DynamicQueues.html
-[glo]: https://oban.pro/docs/pro/Oban.Pro.Engines.Smart.html#module-global-concurrency
-[hoo]: https://oban.pro/docs/pro/Oban.Pro.Worker.html#module-worker-hooks
-[par]: https://oban.pro/docs/pro/Oban.Pro.Engines.Smart.html#module-queue-partitioning
-[ove]: https://oban.pro/docs/pro/overview.html
-[str]: https://oban.pro/docs/pro/Oban.Pro.Worker.html#module-structured-jobs
-[wor]: https://oban.pro/docs/pro/Oban.Pro.Workers.Workflow.html
+- **Workflows** — Compose jobs with arbitrary dependencies for sequential, fan-out, and fan-in
+  execution patterns.
+
+- **Batches** — Process related jobs while tracking overall progress across all nodes and
+  executing optional callbacks.
+
+- **Dynamic Plugins** — Runtime configuration of cron schedules, queues, job priorities, and
+  automatic scaling—ideal for applications that manage jobs dynamically.
+
+- **Decorator** — Build and insert jobs directly from regular functions without defining worker
+  modules.
+
+[Learn more about Oban Pro →](https://oban.pro)
 
 ## Engines
 
@@ -169,16 +168,16 @@ Oban requires:
 
 * Elixir 1.15+
 * Erlang 24+
-* PostgreSQL 12.0+, MySQL 8.4+, or SQLite3 3.37.0+
+* PostgreSQL 14.0+, MySQL 8.4+, or SQLite3 3.37.0+
 
 ## Installation
 
-See the [installation guide](https://hexdocs.pm/oban/installation.html) for details on installing
+See the [installation guide](https://oban.hexdocs.pm/installation.html) for details on installing
 and configuring Oban in your application.
 
 ## Quick Getting Started
 
-  1. [Configure queues](https://hexdocs.pm/oban/Oban.html#module-configuring-queues) and an Ecto repo for Oban to
+  1. [Configure queues](https://oban.hexdocs.pm/defining_queues.html) and an Ecto repo for Oban to
      use:
 
      ```elixir
@@ -202,7 +201,7 @@ and configuring Oban in your application.
      end
      ```
 
-  3. Enqueue a job (see [the documentation](https://hexdocs.pm/oban/Oban.Job.html#enqueueing-jobs)):
+  3. Enqueue a job (see [the documentation](https://oban.hexdocs.pm/Oban.Job.html#enqueueing-jobs)):
 
      ```elixir
      %{email: %{to: "foo@example.com", body: "Hello from Oban!"}}
@@ -234,7 +233,7 @@ There are a few places to connect and communicate with other Oban users:
 
 ## Contributing
 
-To run the Oban test suite you must have PostgreSQL 12+ and MySQL 8+ running. Follow these steps
+To run the Oban test suite you must have PostgreSQL 14+ and MySQL 8+ running. Follow these steps
 to create the database, create the database and run all migrations:
 
 ```bash

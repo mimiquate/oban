@@ -6,6 +6,14 @@ config :logger, level: :warning
 
 config :oban, Oban.Backoff, retry_mult: 1
 
+config :oban, Oban.Repo,
+  retry_opts: [
+    delay: 10,
+    expected_delay: 5,
+    expected_retry: 2,
+    retry: 2
+  ]
+
 config :oban, Oban.Test.Repo,
   migration_lock: false,
   pool: Ecto.Adapters.SQL.Sandbox,

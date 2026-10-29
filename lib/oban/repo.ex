@@ -20,11 +20,44 @@ defmodule Oban.Repo do
       Oban
       |> Oban.config()
       |> Oban.Repo.all(Oban.Job)
+
+  ## Retries
+
+  `transaction/3` is wrapped in a bounded retry loop that tolerates transient failures without
+  surfacing them to callers:
+
+  * `DBConnection.ConnectionError`, `Postgrex.Error`, and `MyXQL.Error` raised from inside a
+    transaction are retried with backoff. Expected conflicts like serialization failures,
+    deadlocks, and lock-not-available use a shorter delay and higher retry count than unexpected
+    errors.
+
+  * `UndefinedFunctionError` raised by the configured repo module is retried on the same loop.
+    This absorbs the window during which the repo module is unavailable, e.g. mid-recompile in a
+    slow dev environment, so periodic plugins and stagers don't crash on a compile blip.
+    Non-transaction operations do not retry; wrap them in `transaction/3` if you need the
+    protection.
+
+  Defaults for both loops are set at compile time and keyed on `Oban.Repo`:
+
+      config :oban, Oban.Repo,
+        retry_opts: [
+          delay: 500,
+          retry: 5,
+          expected_delay: 10,
+          expected_retry: 20,
+          on_exhausted: :raise
+        ]
+
+  Changes require recompiling `:oban`. See `transaction/3` for the meaning of each option and for
+  per-call overrides.
   """
 
   @moduledoc since: "2.2.0"
 
-  alias Oban.{Backoff, Config}
+  alias Oban.{Backoff, Config, Errors}
+
+  require Logger
+  require Errors
 
   @callbacks_without_opts [
     config: 0,
@@ -64,7 +97,17 @@ defmodule Oban.Repo do
     update_all: 3
   ]
 
-  @retry_opts delay: 500, retry: 5, expected_delay: 10, expected_retry: 20
+  @retry_defaults [
+    delay: 500,
+    retry: 5,
+    expected_delay: 10,
+    expected_retry: 20,
+    on_exhausted: :raise
+  ]
+
+  @retry_compiled Application.compile_env(:oban, [__MODULE__, :retry_opts], [])
+
+  @retry_opts Keyword.merge(@retry_defaults, @retry_compiled)
 
   for {fun, arity} <- @callbacks_without_opts do
     args = [Macro.var(:conf, __MODULE__) | Macro.generate_arguments(arity, __MODULE__)]
@@ -137,15 +180,37 @@ defmodule Oban.Repo do
   Wraps `c:Ecto.Repo.transaction/2` with an additional `Oban.Config` argument and automatic
   retries with backoff.
 
+  Unexpected errors such as `DBConnection.ConnectionError`, `Postgrex.Error`, or `MyXQL.Error`
+  will retry with a delay scaled by attempt number. Expected conflicts (serialization failures,
+  deadlocks, and lock-not-available) retry with a shorter delay and higher attempt budget, since
+  they typically resolve quickly once contention clears.
+
   ## Options
 
-  Backoff helpers, in addition to the standard transaction options:
+  In addition to the standard `c:Ecto.Repo.transaction/2` options:
 
-  * `delay` — the time to sleep between retries, defaults to `500ms`
-  * `retry` — the number of retries for unexpected errors, defaults to `5`
-  * `expected_delay` — the time to sleep between expected errors, e.g. `serialization` or
-    `lock_not_available`, defaults to `10ms`
-  * `expected_retry` — the number of retries for expected errors, defaults to `20`
+  * `:delay` — milliseconds to sleep between unexpected-error retries, scaled by attempt and
+    jittered. Defaults to `500`.
+  * `:retry` — maximum attempts for unexpected errors. Defaults to `5`. Pass `0` or `false` to
+    disable retries entirely, including for expected conflicts.
+  * `:expected_delay` — milliseconds to sleep between expected-conflict retries, jittered.
+    Defaults to `10`.
+  * `:expected_retry` — maximum attempts for expected conflicts. Defaults to `20`.
+  * `:on_exhausted` — what to do after the retry budget is spent. `:raise` (the default) reraises
+    the underlying error, matching the original behavior. `:log` writes a `Logger.error` and
+    returns `{:error, exception}`, allowing supervised periodic callers to keep running through a
+    database outage instead of crashing and restarting.
+
+  Defaults are drawn from the compile-time `:retry_opts` configuration documented on the module.
+  Any option passed here overrides the compile-time default for this call.
+
+  > #### Nested Transactions {: .warning}
+  >
+  > When calling `transaction/3` inside an existing transaction, e.g. invoking > `Oban.insert/2`
+  > from within your application's own `Repo.transaction/2` block, pass `retry: false` to disable
+  > retries. A retry after a deadlock or serialization failure inside a savepoint will mask the
+  > real error from the outer transaction and leave you debugging a phantom timeout instead of
+  > the underlying conflict.
   """
   @doc since: "2.18.1"
   def transaction(conf, fun_or_multi, opts \\ []) do
@@ -155,26 +220,54 @@ defmodule Oban.Repo do
   defp transaction(conf, fun_or_multi, opts, attempt) do
     __dispatch__(:transaction, [conf, fun_or_multi], opts)
   rescue
-    error in [DBConnection.ConnectionError, Postgrex.Error, MyXQL.Error] ->
+    error in Errors.retryable_errors() ->
       opts = Keyword.merge(@retry_opts, opts)
 
       cond do
-        expected_error?(error) and attempt < opts[:expected_retry] ->
+        opts[:retry] in [0, false] ->
+          exhausted(error, opts, __STACKTRACE__)
+
+        Errors.expected_error?(error) and attempt < opts[:expected_retry] ->
           jittery_sleep(opts[:expected_delay])
+
+          transaction(conf, fun_or_multi, opts, attempt + 1)
+
+        repo_unavailable?(conf, error) and attempt < opts[:retry] ->
+          jittery_sleep(attempt * opts[:delay])
+
+          transaction(conf, fun_or_multi, opts, attempt + 1)
 
         attempt < opts[:retry] ->
           jittery_sleep(attempt * opts[:delay])
 
-        true ->
-          reraise error, __STACKTRACE__
-      end
+          transaction(conf, fun_or_multi, opts, attempt + 1)
 
-      transaction(conf, fun_or_multi, opts, attempt + 1)
+        true ->
+          exhausted(error, opts, __STACKTRACE__)
+      end
   end
 
-  defp expected_error?(%_{postgres: %{code: :lock_not_available}}), do: true
-  defp expected_error?(%_{postgres: %{code: :serialization_failure}}), do: true
-  defp expected_error?(_error), do: false
+  defp repo_unavailable?(%Config{repo: repo}, %UndefinedFunctionError{module: repo}), do: true
+  defp repo_unavailable?(_conf, _error), do: false
+
+  defp exhausted(error, opts, stacktrace) do
+    case opts[:on_exhausted] do
+      :raise ->
+        reraise error, stacktrace
+
+      :log ->
+        Logger.error(
+          [
+            message: "Oban.Repo exhausted transaction retries: #{inspect(error)}",
+            source: :oban,
+            module: __MODULE__
+          ],
+          domain: [:oban]
+        )
+
+        {:error, error}
+    end
+  end
 
   defp jittery_sleep(delay), do: delay |> Backoff.jitter() |> Process.sleep()
 
@@ -220,7 +313,7 @@ defmodule Oban.Repo do
   end
 
   defp __dispatch__(name, [%Config{} = conf | args]) do
-    dynamic_dispatch(conf, name, args)
+    with_dynamic_repo(conf, fn repo -> apply(repo, name, args) end)
   end
 
   defp __dispatch__(name, [%Config{} = conf | args], opts) when is_list(opts) do
@@ -229,11 +322,7 @@ defmodule Oban.Repo do
       |> default_options()
       |> Keyword.merge(opts)
 
-    dynamic_dispatch(conf, name, args ++ [opts])
-  end
-
-  defp dynamic_dispatch(conf, name, args) do
-    with_dynamic_repo(conf, fn repo -> apply(repo, name, args) end)
+    with_dynamic_repo(conf, fn repo -> apply(repo, name, args ++ [opts]) end)
   end
 
   defp in_transaction?(conf, instance) when is_pid(instance), do: conf.repo.in_transaction?()

@@ -78,6 +78,7 @@ defmodule Oban.Notifier do
   """
 
   alias Oban.{Config, JSON, Registry, Sonar}
+  alias Oban.Notifiers.Listeners
 
   require Logger
 
@@ -128,6 +129,10 @@ defmodule Oban.Notifier do
 
       {:notification, channel :: channel(), decoded :: map()}
 
+  Registration is durable across notifier restarts. If the notifier is unavailable when `listen/2`
+  is called, e.g. because it is restarting after a crash, the registration is still recorded and
+  the notifier picks it up when it reconnects.
+
   ## Example
 
   Register to listen for all `:gossip` channel messages:
@@ -144,7 +149,14 @@ defmodule Oban.Notifier do
   """
   @spec listen(name_or_conf(), channel() | [channel()]) :: :ok
   def listen(name_or_conf \\ Oban, channels) when is_atom(channels) or is_list(channels) do
-    apply_callback(name_or_conf, :listen, [normalize_channels(channels)])
+    conf = to_conf(name_or_conf)
+    channels = normalize_channels(channels)
+
+    for channel <- channels, do: Listeners.register(conf, channel)
+
+    apply_callback(conf, :listen, [channels])
+
+    :ok
   end
 
   @doc """
@@ -166,7 +178,14 @@ defmodule Oban.Notifier do
   """
   @spec unlisten(name_or_conf(), channel() | [channel()]) :: :ok
   def unlisten(name_or_conf \\ Oban, channels) when is_atom(channels) or is_list(channels) do
-    apply_callback(name_or_conf, :unlisten, [normalize_channels(channels)])
+    conf = to_conf(name_or_conf)
+    channels = normalize_channels(channels)
+
+    for channel <- channels, do: Listeners.unregister(conf, channel)
+
+    apply_callback(conf, :unlisten, [channels])
+
+    :ok
   end
 
   @doc """
@@ -192,7 +211,7 @@ defmodule Oban.Notifier do
   """
   @spec notify(name_or_conf(), channel(), payload()) :: :ok | {:error, Exception.t()}
   def notify(name_or_conf \\ Oban, channel, payload) when is_atom(channel) do
-    conf = if is_struct(name_or_conf, Config), do: name_or_conf, else: Oban.config(name_or_conf)
+    conf = to_conf(name_or_conf)
     meta = %{conf: conf, channel: channel, payload: payload}
 
     :telemetry.span([:oban, :notifier, :notify], meta, fn ->
@@ -265,7 +284,14 @@ defmodule Oban.Notifier do
   end
 
   @doc false
-  @spec relay(Config.t(), [pid()], atom(), binary()) :: :ok
+  @spec relay(Config.t(), channel(), binary()) :: :ok
+  def relay(conf, channel, payload) when is_atom(channel) and is_binary(payload) do
+    relay(conf, Listeners.listeners(conf, channel), channel, payload)
+  end
+
+  # Retained for external notifiers that track listeners themselves.
+  @doc false
+  @spec relay(Config.t(), [pid()], channel(), binary()) :: :ok
   def relay(_conf, [], _channel, _payload), do: :ok
 
   def relay(conf, listeners, channel, payload) when is_atom(channel) and is_binary(payload) do
@@ -280,9 +306,12 @@ defmodule Oban.Notifier do
 
   # Helpers
 
-  defp apply_callback(name_or_conf, callback, args) do
-    conf = if is_struct(name_or_conf, Config), do: name_or_conf, else: Oban.config(name_or_conf)
+  defp to_conf(%Config{} = conf), do: conf
+  defp to_conf(name), do: Oban.config(name)
 
+  # Callbacks that reach the notifier process may exit if it crashes mid-call or times out.
+  # Callers can't do anything useful with an exit, so it's normalized into an error tuple here.
+  defp apply_callback(conf, callback, args) do
     %{name: name, notifier: {notifier, _}} = conf
 
     case Registry.whereis(name, __MODULE__) do
@@ -292,6 +321,9 @@ defmodule Oban.Notifier do
       _ ->
         {:error, RuntimeError.exception("no notifier running for instance #{inspect(name)}")}
     end
+  catch
+    :exit, reason ->
+      {:error, RuntimeError.exception("notifier exited with #{inspect(reason)}")}
   end
 
   defp normalize_channels(channels) do
@@ -304,25 +336,40 @@ defmodule Oban.Notifier do
     channels
   end
 
-  defp encode(payload) do
-    payload
-    |> to_encodable()
-    |> JSON.encode_to_iodata!()
-    |> :zlib.gzip()
-    |> Base.encode64()
+  @compress_threshold 512
+
+  @doc false
+  def encode(payload) do
+    iodata =
+      payload
+      |> to_encodable()
+      |> JSON.encode_to_iodata!()
+
+    if IO.iodata_length(iodata) > @compress_threshold do
+      "Z:" <> Base.encode64(:zlib.gzip(iodata))
+    else
+      IO.iodata_to_binary(iodata)
+    end
   end
 
-  defp decode(payload) do
-    case Base.decode64(payload) do
-      {:ok, decoded} ->
-        decoded
-        |> :zlib.gunzip()
-        |> JSON.decode!()
+  @doc false
+  def decode("Z:" <> compressed) do
+    compressed
+    |> Base.decode64!()
+    |> :zlib.gunzip()
+    |> JSON.decode!()
+  end
 
-      # Messages emitted by the insert trigger aren't compressed.
-      :error ->
-        JSON.decode!(payload)
-    end
+  # Legacy compressed format (gzip magic bytes 0x1f 0x8b 0x08 base64 encode to "H4sI")
+  def decode("H4sI" <> _ = compressed) do
+    compressed
+    |> Base.decode64!()
+    |> :zlib.gunzip()
+    |> JSON.decode!()
+  end
+
+  def decode(payload) do
+    JSON.decode!(payload)
   end
 
   defp to_encodable(%_{} = struct), do: struct

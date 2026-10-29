@@ -33,7 +33,7 @@ When the configuration contains **any** invalid options, like an invalid engine,
 you'll see the test fail with an error like this:
 
 ```elixir
-{:error, "expected :engine to be an Oban.Queue.Engine, got: MyApp.Repo"}
+{:error, "expected :engine to implement Oban.Engine, got: MyApp.Repo"}
 ```
 
 ## Testing Dynamic Plugin Config
@@ -60,7 +60,7 @@ You can call that function within a test and then assert that it is valid with
 test "testing cron plugin configuration" do
   config = MyApp.Oban.cron_config()
 
-  assert :ok = Oban.Plugins.Cron.validate(config)
+  assert :ok = Oban.Cron.validate(config)
 end
 ```
 

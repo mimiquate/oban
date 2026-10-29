@@ -43,6 +43,8 @@ defmodule Oban.SonarTest do
     test "reporting a clustered status with multiple nodes" do
       name = start_supervised_oban!(notifier: Oban.Notifiers.Isolated)
 
+      with_backoff(fn -> assert :solitary = Notifier.status(name) end)
+
       Notifier.notify(name, :sonar, %{node: "web.1"})
 
       with_backoff(fn ->
@@ -54,16 +56,19 @@ defmodule Oban.SonarTest do
 
     test "pruning stale nodes based on the last notification time" do
       name = start_supervised_oban!(notifier: Oban.Notifiers.Isolated)
+      sonar = Registry.whereis(name, Sonar)
+
+      # Force handle_continue/2 to run before sending notifications so the
+      # sonar is registered as a :sonar listener.
+      GenServer.call(sonar, :ping)
+
       time = System.monotonic_time(:millisecond)
 
       Notifier.notify(name, :sonar, %{node: "web.0", time: time - :timer.seconds(10)})
-      Notifier.notify(name, :sonar, %{node: "web.1", time: time - :timer.seconds(29)})
-      Notifier.notify(name, :sonar, %{node: "web.2", time: time - :timer.seconds(31)})
+      Notifier.notify(name, :sonar, %{node: "web.1", time: time - :timer.seconds(60)})
+      Notifier.notify(name, :sonar, %{node: "web.2", time: time - :timer.seconds(180)})
 
-      nodes =
-        name
-        |> Registry.whereis(Sonar)
-        |> GenServer.call(:prune_nodes)
+      nodes = GenServer.call(sonar, :prune_nodes)
 
       assert "web.1" in nodes
       refute "web.2" in nodes

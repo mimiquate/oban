@@ -10,7 +10,7 @@ Uniqueness is based on a combination of job attributes based on the following op
   * `:period` — The number of seconds until a job is no longer considered duplicate. You should
     always specify a period, otherwise Oban will default to 60 seconds. `:infinity` can be used to
     indicate the job be considered a duplicate as long as jobs are retained (see
-    `Oban.Plugins.Pruner`).
+    `Oban.Pruner`).
 
   * `:fields` — The fields to compare when evaluating uniqueness. The available fields are
     `:args`, `:queue`, `:worker`, and `:meta`. `:fields` defaults to `[:worker, :queue, :args]`.
@@ -33,6 +33,13 @@ Uniqueness is based on a combination of job attributes based on the following op
 
   * `:timestamp` — Which job timestamp to check the period against. The available timestamps are
     `:inserted_at` or `:scheduled_at`. Defaults to `:inserted_at` for legacy reasons.
+
+> #### Always Include an Insert State {: .tip}
+>
+> Newly inserted jobs land in `available`, `scheduled`, or `suspended`, and uniqueness is only
+> checked at insert time. A custom `:states` list that omits all three, e.g. `[:completed]`, won't
+> detect a duplicate until the original job leaves the state it was inserted into. Workers with
+> such a list emit a compile time warning.
 
 The simplest form of uniqueness will configure uniqueness for as long as a matching job exists in
 the database, regardless of state:
@@ -152,10 +159,10 @@ BusinessWorker.new(
 ```
 
 Another example is bumping the scheduled time on conflict. Either `:scheduled_at` or
-`:schedule_in` values will work, but the replace option is always `:scheduled_at`.
+`:scheduled_in` values will work, but the replace option is always `:scheduled_at`.
 
 ```elixir
-UrgentWorker.new(args, schedule_in: 1, replace: [scheduled: [:scheduled_at]])
+UrgentWorker.new(args, scheduled_in: 1, replace: [scheduled: [:scheduled_at]])
 ```
 
 > #### Jobs in the `:executing` State {: .warning}

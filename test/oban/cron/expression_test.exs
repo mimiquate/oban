@@ -52,6 +52,38 @@ defmodule Oban.Cron.ExpressionTest do
         assert_raise ArgumentError, fn -> Expr.parse!(expression) end
       end
     end
+
+    test "day/month combinations that can never align are rejected" do
+      expressions = [
+        "0 0 30 2 *",
+        "0 0 31 4 *",
+        "0 0 31 2,4,6,9,11 *",
+        "0 0 30,31 FEB *"
+      ]
+
+      for expression <- expressions do
+        assert_raise ArgumentError, fn -> Expr.parse!(expression) end
+      end
+
+      assert {:ok, _} = Expr.parse("0 0 30 2,4 *")
+      assert {:ok, _} = Expr.parse("0 0 29 2 *")
+    end
+
+    test "ranges with bounds outside the field are rejected before expansion" do
+      expressions = [
+        "0-99999999 * * * *",
+        "0-99999999/1 * * * *",
+        "99999999/1 * * * *",
+        "* 0-24 * * *",
+        "* * 0-31 * *",
+        "* * * 0-12 *",
+        "* * * * 0-7"
+      ]
+
+      for expression <- expressions do
+        assert_raise ArgumentError, fn -> Expr.parse!(expression) end
+      end
+    end
   end
 
   describe "now?/2" do

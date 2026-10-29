@@ -1,7 +1,7 @@
-defmodule Oban.Plugins.LifelineTest do
+defmodule Oban.LifelineTest do
   use Oban.Case, async: true
 
-  alias Oban.Plugins.Lifeline
+  alias Oban.Lifeline
   alias Oban.TelemetryHandler
   alias Oban.Test.DolphinRepo
 
@@ -14,6 +14,14 @@ defmodule Oban.Plugins.LifelineTest do
       assert :ok = Lifeline.validate(rescue_after: :timer.minutes(30))
     end
 
+    test "validating interval and rescue_after as period tuples" do
+      assert {:error, _} = Lifeline.validate(interval: {0, :seconds})
+      assert {:error, _} = Lifeline.validate(rescue_after: {1, :eon})
+
+      assert :ok = Lifeline.validate(interval: {1, :minute})
+      assert :ok = Lifeline.validate(rescue_after: {30, :minutes})
+    end
+
     test "providing suggestions for unknown options" do
       assert {:error, "unknown option :inter, did you mean :interval?"} =
                Lifeline.validate(inter: 1)
@@ -21,12 +29,10 @@ defmodule Oban.Plugins.LifelineTest do
   end
 
   describe "integration" do
-    setup do
-      TelemetryHandler.attach_events()
-    end
-
     test "rescuing executing jobs older than the rescue window" do
       name = start_supervised_oban!(plugins: [{Lifeline, rescue_after: 5_000}])
+
+      TelemetryHandler.attach_events(oban_name: name)
 
       job_1 = insert!(%{}, state: "executing", attempted_at: seconds_ago(3))
       job_2 = insert!(%{}, state: "executing", attempted_at: seconds_ago(7))
@@ -50,6 +56,8 @@ defmodule Oban.Plugins.LifelineTest do
     test "rescuing jobs within a custom prefix" do
       name = start_supervised_oban!(prefix: "private", plugins: [{Lifeline, rescue_after: 5_000}])
 
+      TelemetryHandler.attach_events(oban_name: name)
+
       job_1 = insert!(name, %{}, state: "executing", attempted_at: seconds_ago(1))
       job_2 = insert!(name, %{}, state: "executing", attempted_at: seconds_ago(7))
 
@@ -65,10 +73,6 @@ defmodule Oban.Plugins.LifelineTest do
   end
 
   describe "compatibility" do
-    setup do
-      TelemetryHandler.attach_events()
-    end
-
     @tag :dolphin
     test "rescuing stuck jobs using the Dolphin engine" do
       name =
@@ -77,6 +81,8 @@ defmodule Oban.Plugins.LifelineTest do
           plugins: [{Lifeline, rescue_after: 5_000}],
           repo: DolphinRepo
         )
+
+      TelemetryHandler.attach_events(oban_name: name)
 
       job_1 =
         Oban.insert!(name, Worker.new(%{}, state: "executing", attempted_at: seconds_ago(3)))

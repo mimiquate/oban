@@ -3,7 +3,7 @@ defmodule Oban.Nursery do
 
   use Supervisor
 
-  alias Oban.{Config, Midwife, Registry}
+  alias Oban.{Config, Queues, Registry}
 
   @type opts :: [conf: Config.t(), name: GenServer.name()]
 
@@ -22,10 +22,12 @@ defmodule Oban.Nursery do
   @impl Supervisor
   def init(opts) do
     conf = Keyword.fetch!(opts, :conf)
+    foreman_name = Registry.via(conf.name, Foreman)
+    queues_name = Registry.via(conf.name, Queues)
 
     children = [
-      {DynamicSupervisor, name: Registry.via(conf.name, Foreman)},
-      {Midwife, conf: conf, name: Registry.via(conf.name, Midwife)}
+      {DynamicSupervisor, name: foreman_name, max_restarts: 20, max_seconds: 60},
+      {Queues, conf: conf, name: queues_name, queues: conf.queues}
     ]
 
     Supervisor.init(children, max_restarts: 5, max_seconds: 30, strategy: :rest_for_one)

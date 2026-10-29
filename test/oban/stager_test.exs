@@ -1,7 +1,7 @@
 defmodule Oban.StagerTest do
   use Oban.Case, async: true
 
-  alias Oban.Stager
+  alias Oban.{Sonar, Stager}
   alias Oban.TelemetryHandler
 
   test "descheduling jobs to make them available for execution" do
@@ -9,7 +9,7 @@ defmodule Oban.StagerTest do
     job_2 = insert!(%{}, state: "scheduled", scheduled_at: seconds_from_now(10))
     job_3 = insert!(%{}, state: "retryable")
 
-    start_supervised_oban!(stage_interval: 5, testing: :disabled)
+    start_supervised_oban!(stager: [interval: 5], testing: :disabled)
 
     with_backoff(fn ->
       assert %{state: "available"} = Repo.reload(job_1)
@@ -19,9 +19,9 @@ defmodule Oban.StagerTest do
   end
 
   test "emitting telemetry data for staged jobs" do
-    TelemetryHandler.attach_events()
+    name = start_supervised_oban!(stager: [interval: 5], testing: :disabled)
 
-    start_supervised_oban!(stage_interval: 5, testing: :disabled)
+    TelemetryHandler.attach_events(oban_name: name)
 
     assert_receive {:event, :stop, %{duration: _}, %{plugin: Stager} = meta}
 
@@ -31,7 +31,7 @@ defmodule Oban.StagerTest do
   test "switching to local mode without functional pubsub" do
     :telemetry_test.attach_event_handlers(self(), [[:oban, :stager, :switch]])
 
-    [stage_interval: 5, notifier: {Oban.Notifiers.Isolated, connected: false}]
+    [stager: [interval: 5], notifier: {Oban.Notifiers.Isolated, connected: false}]
     |> start_supervised_oban!()
     |> ping_sonar()
 
@@ -42,7 +42,7 @@ defmodule Oban.StagerTest do
     :telemetry_test.attach_event_handlers(self(), [[:oban, :stager, :switch]])
 
     opts = [
-      stage_interval: 5,
+      stager: [interval: 5],
       notifier: Oban.Notifiers.Isolated,
       peer: {Oban.Peers.Isolated, leader?: false}
     ]
@@ -57,7 +57,7 @@ defmodule Oban.StagerTest do
   test "dispatching directly to registered producers in local mode" do
     name =
       start_supervised_oban!(
-        stage_interval: 5,
+        stager: [interval: 5],
         notifier: Oban.Notifiers.Isolated,
         peer: {Oban.Peers.Isolated, leader?: false}
       )
@@ -73,7 +73,7 @@ defmodule Oban.StagerTest do
 
   defp ping_sonar(name) do
     name
-    |> Oban.Registry.whereis(Oban.Sonar)
-    |> send(:ping)
+    |> Oban.Registry.whereis(Sonar)
+    |> GenServer.call(:ping)
   end
 end
